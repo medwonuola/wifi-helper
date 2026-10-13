@@ -4,7 +4,7 @@ from dataclasses import asdict
 import time
 from typing import Callable
 from rich.console import Console
-from . import history
+from . import history, net
 from .config import Settings
 from .diagnose import EXPLANATIONS, Action, IncidentState, Snapshot, Verdict, choose_action, classify, full_check, quick_check
 from .modem import AuthError, ModemClient
@@ -133,9 +133,23 @@ class Watchdog:
             snap = full_check(self.settings)
             verdict = classify(snap)
 
+    def self_check(self) -> None:
+        """Log what this process can see. Background services can be denied LAN access by the OS."""
+        home = net.check_home_network(self.settings)
+        if not home.is_home:
+            log(f"Not on home network yet ({home.reason}); waiting.")
+            return
+        modem_ok = net.tcp_reachable(self.settings.modem_host, 80)
+        log(f"Home network ok (gateway {home.gateway}, mac {home.gateway_mac or 'unknown'}); "
+            f"modem {'reachable' if modem_ok else '[red]NOT reachable[/red]'}")
+        if not modem_ok:
+            log("[red]Can't reach the modem from this process. On macOS, check System Settings > "
+                "Privacy & Security > Local Network.[/red]")
+
     def run(self) -> None:
         s = self.settings
         log(f"[bold green]wifi-helper watchdog started[/bold green] (every {s.check_interval}s, home gateways: {', '.join(s.home_gateways)})")
+        self.self_check()
         offline_streak = 0
         first_fail: tuple[float, str] | None = None  # when the current outage really began
         outage: Outage | None = None
