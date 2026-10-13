@@ -45,6 +45,9 @@ AUTH_ERRORS = {
 }
 
 
+TOKEN_ERRORS = ("125001", "125002", "125003")
+
+
 class ModemError(Exception):
     pass
 
@@ -215,7 +218,7 @@ class ModemClient:
 
     def get_xml(self, endpoint: str) -> ET.Element:
         r = self.get(endpoint)
-        if _error_code(r.text) in ("125001", "125002", "125003"):
+        if _error_code(r.text) in TOKEN_ERRORS:
             self.tokens.clear()
             self.tokens.append(self._new_session())
             r = self.get(endpoint)
@@ -227,22 +230,27 @@ class ModemClient:
             return
         if not self.password:
             raise AuthError("MODEM_PASSWORD is not set")
-        token = self._new_session()
-        headers = {
-            "__RequestVerificationToken": token,
-            "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
-            "X-Requested-With": "XMLHttpRequest",
-        }
         nonce = generate_nonce()
         chal_xml = (
             '<?xml version="1.0" encoding="UTF-8"?><request>'
             f"<username>{escape(self.username)}</username><firstnonce>{nonce}</firstnonce><mode>1</mode></request>"
         )
-        r_chal = self.client.post("/api/user/challenge_login", content=chal_xml, headers=headers)
-        if _error_code(r_chal.text) == "125003":
-            time.sleep(1.0)
+        # Tokens are single-use and the modem rejects stale ones (125002/125003), which
+        # happens more when it's busy. Retry with a fresh session; never count it as a bad login.
+        for attempt in range(3):
+            token = self._new_session()
+            headers = {
+                "__RequestVerificationToken": token,
+                "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+                "X-Requested-With": "XMLHttpRequest",
+            }
             r_chal = self.client.post("/api/user/challenge_login", content=chal_xml, headers=headers)
-        code = _error_code(r_chal.text)
+            code = _error_code(r_chal.text)
+            if code not in TOKEN_ERRORS:
+                break
+            time.sleep(1.0 + attempt)
+        if code in TOKEN_ERRORS:
+            raise ModemError(f"modem kept rejecting session tokens (error {code}); it may be busy")
         if code in ("100002", "100004", "100006"):
             return self._legacy_login(token)
         if code:
@@ -263,6 +271,8 @@ class ModemClient:
         r_auth = self.client.post("/api/user/authentication_login", content=auth_xml, headers=headers)
         self._add_tokens_from_response(r_auth)
         code = _error_code(r_auth.text)
+        if code in TOKEN_ERRORS:
+            raise ModemError(f"modem rejected the session token (error {code}); it may be busy")
         if code or "<response>" not in r_auth.text:
             raise AuthError(AUTH_ERRORS.get(code or "", f"login failed (error {code})"), code)
         self.logged_in = True
