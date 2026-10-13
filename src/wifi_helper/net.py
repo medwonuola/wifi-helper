@@ -1,6 +1,6 @@
 """Low-level network probes. Nothing here needs a login or the internet."""
 
-from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout, as_completed
 from dataclasses import dataclass
 import re
 import secrets
@@ -119,18 +119,33 @@ def system_dns_ok(name: str = DNS_PROBE_NAME, timeout: float = 3.0) -> bool:
         pool.shutdown(wait=False)
 
 
+def _http_status(url: str, timeout: float) -> int | None:
+    try:
+        with httpx.Client(timeout=timeout, follow_redirects=False) as c:
+            return c.get(url).status_code
+    except Exception:
+        return None
+
+
 def http_check(timeout: float = 3.0) -> str:
-    """'ok' (got 204), 'redirect' (something answered instead), or 'fail'."""
+    """'ok' (got 204), 'redirect' (something answered instead), or 'fail'.
+
+    Runs under a hard deadline: httpx's timeout doesn't cover the DNS lookup, which
+    can hang for minutes when the link is dead.
+    """
+    pool = ThreadPoolExecutor(len(HTTP_204_URLS))
+    futures = [pool.submit(_http_status, url, timeout) for url in HTTP_204_URLS]
     saw_other = False
-    for url in HTTP_204_URLS:
-        try:
-            with httpx.Client(timeout=timeout, follow_redirects=False) as c:
-                r = c.get(url)
-            if r.status_code == 204:
+    try:
+        for f in as_completed(futures, timeout=timeout + 1.0):
+            code = f.result()
+            if code == 204:
                 return "ok"
-            saw_other = True
-        except Exception:
-            continue
+            saw_other = saw_other or code is not None
+    except FutureTimeout:
+        pass
+    finally:
+        pool.shutdown(wait=False, cancel_futures=True)
     return "redirect" if saw_other else "fail"
 
 

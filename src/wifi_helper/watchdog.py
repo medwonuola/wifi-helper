@@ -137,6 +137,7 @@ class Watchdog:
         s = self.settings
         log(f"[bold green]wifi-helper watchdog started[/bold green] (every {s.check_interval}s, home gateways: {', '.join(s.home_gateways)})")
         offline_streak = 0
+        first_fail: tuple[float, str] | None = None  # when the current outage really began
         outage: Outage | None = None
 
         while True:
@@ -147,11 +148,12 @@ class Watchdog:
                         outage.close("left home network" if not snap.home.is_home else None)
                         if snap.home.is_home:
                             log(f"[green]Online again after {outage.incident.duration_s:.0f}s.[/green]")
-                    offline_streak, outage = 0, None
+                    offline_streak, outage, first_fail = 0, None, None
                     time.sleep(s.check_interval)
                     continue
 
                 offline_streak += 1
+                first_fail = first_fail or (time.monotonic(), history.now_iso())
                 if offline_streak < s.offline_checks_before_fix:
                     time.sleep(min(s.check_interval, 5))
                     continue
@@ -161,13 +163,13 @@ class Watchdog:
                 if verdict in (Verdict.ONLINE, Verdict.NOT_HOME):
                     continue
                 if outage is None:
-                    outage = Outage(verdict)
+                    outage = Outage(verdict, *first_fail)
                     log(f"[bold red]Offline: {verdict.value}[/bold red] {EXPLANATIONS[verdict]}")
                 elif outage.state.exhausted_for(s.reboot_cooldown):
                     outage.state = IncidentState()  # long outage: allow the ladder again
                 if self.heal(snap, outage.incident, outage.state):
                     outage.close(outage.incident.recovered_by)
-                    offline_streak, outage = 0, None
+                    offline_streak, outage, first_fail = 0, None, None
             except KeyboardInterrupt:
                 if outage:
                     outage.close("watchdog stopped")
@@ -178,9 +180,9 @@ class Watchdog:
 
 
 class Outage:
-    def __init__(self, verdict: Verdict):
-        self.t0 = time.monotonic()
-        self.incident = history.Incident(started=history.now_iso(), verdict=verdict.value)
+    def __init__(self, verdict: Verdict, t0: float | None = None, started: str | None = None):
+        self.t0 = time.monotonic() if t0 is None else t0
+        self.incident = history.Incident(started=started or history.now_iso(), verdict=verdict.value)
         self.state = IncidentState()
 
     def close(self, recovered_by: str | None) -> None:

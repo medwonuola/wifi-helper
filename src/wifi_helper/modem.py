@@ -156,7 +156,10 @@ class ModemClient:
 
     def _new_session(self) -> str:
         """Fetch a session cookie and token. Most requests fail with 125002 without one."""
-        r = self.client.get("/api/webserver/SesTokInfo")
+        try:
+            r = self.client.get("/api/webserver/SesTokInfo")
+        except (httpx.RemoteProtocolError, httpx.ReadError):
+            r = self.client.get("/api/webserver/SesTokInfo")
         return ET.fromstring(r.text).findtext("TokInfo") or ""
 
     def _get_token(self) -> str | None:
@@ -192,7 +195,11 @@ class ModemClient:
         tok = self._get_token()
         if tok:
             headers["__RequestVerificationToken"] = tok
-        r = self.client.get(endpoint, headers=headers)
+        try:
+            r = self.client.get(endpoint, headers=headers)
+        except (httpx.RemoteProtocolError, httpx.ReadError):
+            # The modem's web server sometimes drops a reused connection; GETs are safe to retry.
+            r = self.client.get(endpoint, headers=headers)
         self._add_tokens_from_response(r)
         return r
 
