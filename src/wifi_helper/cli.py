@@ -134,7 +134,7 @@ def status():
         t.add_column()
         bars = "█" * mon.signal_bars + "░" * max(0, 5 - mon.signal_bars)
         t.add_row("Carrier", st.operator_name)
-        t.add_row("Network", mon.network_type + (" + 5G NR" if st.nr_active and "5G" not in mon.network_type else ""))
+        t.add_row("Network", mon.network_type + (" with 5G NR" if st.nr_active and "5G" not in mon.network_type else ""))
         t.add_row("Signal", f"{bars} ({mon.signal_bars}/5)")
         t.add_row("Connection", mon.connection_label)
         t.add_row("Cellular IP", st.wan_ip + (" (carrier NAT)" if is_cgnat(st.wan_ip) else ""))
