@@ -10,7 +10,7 @@ from .diagnose import EXPLANATIONS, Action, IncidentState, Snapshot, Verdict, ch
 from .modem import AuthError, ModemClient
 from .router import RouterClient
 
-console = Console()
+console = Console(emoji=False)
 
 # How long to wait for the internet to come back after each action.
 RECOVERY_WAIT = {Action.CYCLE_DATA: 45, Action.REBOOT_MODEM: 180, Action.REBOOT_ROUTER: 150}
@@ -133,23 +133,24 @@ class Watchdog:
             snap = full_check(self.settings)
             verdict = classify(snap)
 
-    def self_check(self) -> None:
+    def self_check(self) -> bool:
         """Log what this process can see. Background services can be denied LAN access by the OS."""
         home = net.check_home_network(self.settings)
         if not home.is_home:
-            log(f"Not on home network yet ({home.reason}); waiting.")
-            return
+            log(f"Not on home network ({home.reason}); idle until it's back.")
+            return False
         modem_ok = net.tcp_reachable(self.settings.modem_host, 80)
         log(f"Home network ok (gateway {home.gateway}, mac {home.gateway_mac or 'unknown'}); "
             f"modem {'reachable' if modem_ok else '[red]NOT reachable[/red]'}")
         if not modem_ok:
             log("[red]Can't reach the modem from this process. On macOS, check System Settings > "
                 "Privacy & Security > Local Network.[/red]")
+        return True
 
     def run(self) -> None:
         s = self.settings
         log(f"[bold green]wifi-helper watchdog started[/bold green] (every {s.check_interval}s, home gateways: {', '.join(s.home_gateways)})")
-        self.self_check()
+        was_home = self.self_check()
         offline_streak = 0
         first_fail: tuple[float, str] | None = None  # when the current outage really began
         outage: Outage | None = None
@@ -157,6 +158,12 @@ class Watchdog:
         while True:
             try:
                 snap = quick_check(s)
+                if snap.home.is_home != was_home:
+                    was_home = snap.home.is_home
+                    if was_home:
+                        self.self_check()
+                    else:
+                        log(f"Left home network ({snap.home.reason}); idle until it's back.")
                 if not snap.home.is_home or snap.http == "ok":
                     if outage:
                         outage.close("left home network" if not snap.home.is_home else None)

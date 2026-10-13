@@ -18,7 +18,7 @@ app = typer.Typer(
 )
 sms_app = typer.Typer(help="Read and send SMS through the modem's SIM.", no_args_is_help=True)
 app.add_typer(sms_app, name="sms")
-console = Console()
+console = Console(emoji=False)
 
 
 def ok(v: bool | None, yes: str = "yes", no: str = "no") -> str:
