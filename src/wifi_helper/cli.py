@@ -1,297 +1,366 @@
-from pathlib import Path
-import subprocess
 import sys
-from typing import Annotated, Optional
+from typing import Annotated, NoReturn
 from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
 import typer
-from .modem import ModemClient
-from .net import get_current_ssid, get_default_gateway, has_internet, is_target_network
+from . import history, net, service
+from .config import ENV_FILE, env_candidates, settings
+from .diagnose import EXPLANATIONS, Action, IncidentState, Snapshot, Verdict, choose_action, classify, full_check
+from .modem import AuthError, ModemClient, ModemError
 from .router import RouterClient
-from .watchdog import Watchdog
+from .watchdog import Outage, Watchdog
 
-app = typer.Typer(help="CLI tool and auto-heal daemon for your Huawei Wi-Fi network.")
-sms_app = typer.Typer(help="SMS inbox, reading, and sending commands.")
+app = typer.Typer(
+    help="Offline helper for Huawei HiLink 4G/5G home internet (Airtel, MTN, Glo, ...): diagnose, fix, watch.",
+    no_args_is_help=True,
+    pretty_exceptions_enable=False,
+)
+sms_app = typer.Typer(help="Read and send SMS through the modem's SIM.", no_args_is_help=True)
 app.add_typer(sms_app, name="sms")
 console = Console()
 
 
+def ok(v: bool | None, yes: str = "yes", no: str = "no") -> str:
+    if v is None:
+        return "[dim]not checked[/dim]"
+    return f"[green]{yes}[/green]" if v else f"[red]{no}[/red]"
+
+
+def fail(msg: str) -> NoReturn:
+    console.print(f"[red]{msg}[/red]")
+    raise typer.Exit(1)
+
+
+def require_home() -> None:
+    home = net.check_home_network(settings)
+    if not home.is_home:
+        fail(f"Not on your home network ({home.reason}). Refusing to touch devices. See `wifi config`.")
+
+
+@app.command()
+def doctor():
+    """Check every hop from this computer to the internet and explain what's wrong. Changes nothing."""
+    snap = full_check(settings)
+    verdict = classify(snap)
+    print_snapshot(snap)
+    print_verdict(snap, verdict)
+
+
+def print_snapshot(snap: Snapshot) -> None:
+    t = Table(title="Path check", show_header=True, header_style="bold cyan")
+    t.add_column("Hop")
+    t.add_column("Result")
+    t.add_column("Detail", style="dim")
+    h = snap.home
+    t.add_row("Home network", ok(h.is_home), f"gateway {h.gateway or '-'}  mac {h.gateway_mac or '-'}  wifi {h.ssid or 'hidden by OS'}")
+    if not h.is_home:
+        console.print(t)
+        return
+    if snap.router_reachable is not None:
+        t.add_row("Router", ok(snap.router_reachable, "reachable", "unreachable"), settings.router_host)
+    t.add_row("Modem", ok(snap.modem_reachable, "reachable", "unreachable"), settings.modem_host)
+    if snap.modem:
+        m = snap.modem
+        bars = "█" * m.signal_bars + "░" * max(0, 5 - m.signal_bars)
+        t.add_row("Modem says", ok(m.connected, m.connection_label, m.connection_label), f"{bars} {m.network_type}  sim {ok(m.sim_ok, 'ok', 'problem')}")
+        t.add_row(
+            "Carrier link",
+            ok(snap.bearer_ok, "carrier answers", "carrier silent"),
+            f"DNS probe to {', '.join(m.carrier_dns) or '-'} (proves the cellular link carries traffic)",
+        )
+    elif snap.modem_error:
+        t.add_row("Modem says", "[yellow]unknown[/yellow]", snap.modem_error)
+    t.add_row("Internet (IP)", ok(snap.ip_ok, "reachable", "unreachable"), "TCP to 1.1.1.1 / 8.8.8.8 / 9.9.9.9")
+    t.add_row("DNS (this device)", ok(snap.dns_ok, "resolving", "failing"), net.DNS_PROBE_NAME)
+    web = {"ok": "[green]ok (204)[/green]", "redirect": "[yellow]redirected[/yellow]", "fail": "[red]failing[/red]"}[snap.http]
+    t.add_row("Web check", web, "generate_204")
+    if snap.vpn_iface:
+        t.add_row("Traffic leaves via", f"[yellow]{snap.vpn_iface} (VPN)[/yellow]" if snap.vpn_active else snap.vpn_iface, "")
+    console.print(t)
+
+
+def print_verdict(snap: Snapshot, verdict: Verdict) -> None:
+    action = choose_action(
+        verdict, IncidentState(), router_configured=settings.router_configured, last_reboot_at=0, reboot_cooldown=0, now=0
+    )
+    color = "green" if verdict == Verdict.ONLINE else "yellow" if verdict == Verdict.NOT_HOME else "red"
+    body = EXPLANATIONS[verdict]
+    if action != Action.NONE:
+        body += f"\n\n`wifi fix` would start with: [bold]{action.value}[/bold]"
+    console.print(Panel(body, title=f"[{color}]{verdict.value}[/{color}]", border_style=color))
+    if snap.home.is_home and snap.home.gateway_mac and not settings.home_gateway_mac:
+        console.print(f"[dim]Tip: pin your network by adding HOME_GATEWAY_MAC={snap.home.gateway_mac} to your .env[/dim]")
+
+
+@app.command()
+def fix(dry_run: Annotated[bool, typer.Option("--dry-run", help="Show what would be done without doing it")] = False):
+    """Diagnose and apply the smallest fix that works (cycle data, then reboot)."""
+    wd = Watchdog(settings, dry_run=dry_run)
+    snap = full_check(settings)
+    verdict = classify(snap)
+    if verdict in (Verdict.ONLINE, Verdict.NOT_HOME):
+        print_verdict(snap, verdict)
+        return
+    print_snapshot(snap)
+    outage = Outage(verdict)
+    seen: list[Verdict] = []
+
+    def on_step(_snap: Snapshot, v: Verdict) -> None:
+        if not seen or seen[-1] != v:
+            seen.append(v)
+            console.print(f"[bold]{v.value}[/bold]: {EXPLANATIONS[v]}")
+
+    recovered = wd.heal(snap, outage.incident, outage.state, on_step)
+    if not dry_run:
+        outage.close(outage.incident.recovered_by if recovered else "not recovered")
+    if recovered:
+        console.print("[bold green]Internet is back.[/bold green]")
+    else:
+        fail("Out of safe automatic fixes. See the explanation above.")
+
+
 @app.command()
 def status():
-    table = Table(title="Local Link Status", show_header=True, header_style="bold cyan")
-    table.add_column("Property", style="dim")
-    table.add_column("Value")
-
-    gw = get_default_gateway() or "Unknown"
-    ssid = get_current_ssid() or "Unknown"
-    target = is_target_network()
-    online = has_internet()
-
-    table.add_row("Default Gateway", gw)
-    table.add_row("Wi-Fi SSID", ssid)
-    table.add_row("Target Network", "[green]Yes[/green]" if target else "[yellow]No[/yellow]")
-    table.add_row("Internet Flow", "[green]Online[/green]" if online else "[bold red]Offline / Degraded[/bold red]")
-    console.print(table)
-    console.print()
-
-    if not target:
-        console.print("[yellow]Not connected to target Wi-Fi network.[/yellow]")
-        return
-
+    """Signal, network type, data usage, SMS count and connected devices."""
+    require_home()
     try:
         with ModemClient() as m:
             st = m.status()
             unread, inbox, max_m = m.sms_counts()
-
-            m_table = Table(title="5G Modem (192.168.118.1)", show_header=True, header_style="bold magenta")
-            m_table.add_column("Property", style="dim")
-            m_table.add_column("Value")
-
-            bars = "█" * st.signal_bars + "░" * (5 - st.signal_bars)
-            m_table.add_row("Carrier", st.operator_name)
-            m_table.add_row("Network Type", st.network_type)
-            m_table.add_row("Signal Strength", f"{bars} ({st.signal_bars}/5 bars)")
-            m_table.add_row("Connection Status", st.connection_status)
-            m_table.add_row("Cellular WAN IP", st.wan_ip)
-            m_table.add_row("Current Rates", f"↓ {st.current_download_rate // 1024} KB/s  ↑ {st.current_upload_rate // 1024} KB/s")
-            m_table.add_row("Total Data Used", f"↓ {st.total_download_bytes / (1024**3):.2f} GB  ↑ {st.total_upload_bytes / (1024**3):.2f} GB")
-            m_table.add_row("SMS Storage", f"{inbox}/{max_m} ({unread} unread)")
-
-            console.print(m_table)
-            console.print()
+        mon = st.monitoring
+        t = Table(title=f"Modem ({settings.modem_host})", show_header=False)
+        t.add_column(style="dim")
+        t.add_column()
+        bars = "█" * mon.signal_bars + "░" * max(0, 5 - mon.signal_bars)
+        t.add_row("Carrier", st.operator_name)
+        t.add_row("Network", mon.network_type + (" + 5G NR" if st.nr_active and "5G" not in mon.network_type else ""))
+        t.add_row("Signal", f"{bars} ({mon.signal_bars}/5)")
+        t.add_row("Connection", mon.connection_label)
+        t.add_row("Cellular IP", st.wan_ip + (" (carrier NAT)" if is_cgnat(st.wan_ip) else ""))
+        t.add_row("Carrier DNS", ", ".join(mon.carrier_dns) or "-")
+        t.add_row("Speed now", f"↓ {st.current_download_rate * 8 / 1e6:.1f} Mbps  ↑ {st.current_upload_rate * 8 / 1e6:.1f} Mbps")
+        t.add_row("Data since reset", f"↓ {st.total_download_bytes / 1e9:.2f} GB  ↑ {st.total_upload_bytes / 1e9:.2f} GB")
+        t.add_row("SMS", f"{inbox}/{max_m} ({unread} unread)")
+        console.print(t)
     except Exception as e:
-        console.print(f"[red]Failed to query modem: {e}[/red]\n")
+        console.print(f"[red]Modem: {e}[/red]")
 
+    if not settings.router_configured or settings.router_host == settings.modem_host:
+        return
     try:
         with RouterClient() as r:
             rst = r.status()
-
-            r_table = Table(title="Wi-Fi Router (192.168.3.1)", show_header=True, header_style="bold blue")
-            r_table.add_column("Property", style="dim")
-            r_table.add_column("Value")
-
-            r_table.add_row("Device Model", rst.device_name)
-            r_table.add_row("HarmonyOS", rst.harmony_version)
-            r_table.add_row("WAN IP", rst.wan_ip)
-            r_table.add_row("WAN Gateway", rst.wan_gateway)
-            r_table.add_row("WAN Status", rst.wan_status)
-            r_table.add_row("Active Clients", str(rst.active_hosts_count))
-
-            console.print(r_table)
+        t = Table(title=f"Router ({settings.router_host})", show_header=False)
+        t.add_column(style="dim")
+        t.add_column()
+        t.add_row("Model", rst.device_name)
+        t.add_row("Firmware", rst.harmony_version)
+        t.add_row("WAN", f"{rst.wan_ip} via {rst.wan_gateway} ({rst.wan_status})")
+        t.add_row("Active devices", str(rst.active_hosts_count))
+        console.print(t)
     except Exception as e:
-        console.print(f"[red]Failed to query router: {e}[/red]\n")
+        console.print(f"[red]Router: {e}[/red]")
 
 
-@sms_app.command("list")
-def sms_list(
-    count: Annotated[int, typer.Option("--count", "-c", help="Number of messages to display")] = 10,
-    page: Annotated[int, typer.Option("--page", "-p", help="Page number")] = 1,
-):
-    try:
-        with ModemClient() as m:
-            unread, inbox, max_m = m.sms_counts()
-            console.print(f"[bold]Inbox:[/bold] {inbox}/{max_m} total messages ({unread} unread)\n")
-
-            messages = m.sms_list(page=page, count=count)
-            if not messages:
-                console.print("[yellow]No messages found.[/yellow]")
-                return
-
-            table = Table(show_header=True, header_style="bold green")
-            table.add_column("Date", style="dim", no_wrap=True)
-            table.add_column("Sender", style="cyan", no_wrap=True)
-            table.add_column("Status", no_wrap=True)
-            table.add_column("Message")
-
-            for msg in messages:
-                status_str = "[bold red]UNREAD[/bold red]" if msg.is_unread else "[dim]READ[/dim]"
-                table.add_row(msg.date, msg.phone, status_str, msg.content.strip())
-
-            console.print(table)
-    except Exception as e:
-        console.print(f"[red]Failed to fetch SMS: {e}[/red]")
-        sys.exit(1)
-
-
-@sms_app.command("send")
-def sms_send(
-    phone: Annotated[str, typer.Argument(help="Recipient phone number")],
-    message: Annotated[str, typer.Argument(help="SMS text message content")],
-):
-    try:
-        with ModemClient() as m:
-            console.print(f"Sending SMS to [cyan]{phone}[/cyan]...")
-            if m.sms_send(phone, message):
-                console.print("[green]SMS sent successfully![/green]")
-            else:
-                console.print("[red]Failed to send SMS.[/red]")
-                sys.exit(1)
-    except Exception as e:
-        console.print(f"[red]Error sending SMS: {e}[/red]")
-        sys.exit(1)
-
-
-@app.command()
-def ussd(
-    code: Annotated[str, typer.Argument(help="USSD code string, e.g. *312#")],
-    timeout: Annotated[int, typer.Option("--timeout", "-t", help="Timeout in seconds")] = 25,
-):
-    console.print(f"Running USSD code [cyan]{code}[/cyan] (timeout {timeout}s)...")
-    try:
-        with ModemClient() as m:
-            res = m.ussd_send(code, timeout_seconds=timeout)
-            console.print(Panel(res, title=f"USSD Response ({code})", border_style="cyan"))
-    except Exception as e:
-        console.print(f"[red]USSD execution failed: {e}[/red]")
-        sys.exit(1)
+def is_cgnat(ip: str) -> bool:
+    parts = ip.split(".")
+    if len(parts) != 4 or not all(p.isdigit() for p in parts):
+        return False
+    a, b = int(parts[0]), int(parts[1])
+    return a == 10 or (a == 100 and 64 <= b <= 127) or (a == 172 and 16 <= b <= 31) or (a == 192 and b == 168)
 
 
 @app.command()
 def cycle():
-    console.print("Cycling mobile cellular data switch (soft fix)...")
+    """Turn mobile data off and on (fast fix, ~10-30s, Wi-Fi stays up)."""
+    require_home()
     try:
         with ModemClient() as m:
-            if m.cycle_data():
-                console.print("[green]Data connection cycled successfully.[/green]")
-            else:
-                console.print("[red]Failed to cycle mobile data.[/red]")
-                sys.exit(1)
-    except Exception as e:
-        console.print(f"[red]Error: {e}[/red]")
-        sys.exit(1)
+            if not m.cycle_data():
+                fail("Modem didn't accept the data switch.")
+        console.print("[green]Data connection restarted.[/green]")
+    except ModemError as e:
+        fail(str(e))
 
 
 @app.command()
 def reboot(
-    modem: Annotated[bool, typer.Option("--modem", "-m", help="Reboot only the 5G modem")] = False,
-    router: Annotated[bool, typer.Option("--router", "-r", help="Reboot only the Wi-Fi router")] = False,
-    all_devs: Annotated[bool, typer.Option("--all", "-a", help="Reboot both devices")] = False,
+    modem: Annotated[bool, typer.Option("--modem", "-m", help="Reboot the modem (default)")] = False,
+    router: Annotated[bool, typer.Option("--router", "-r", help="Reboot the Wi-Fi router")] = False,
+    all_devs: Annotated[bool, typer.Option("--all", "-a", help="Reboot both")] = False,
 ):
-    if not modem and not router and not all_devs:
+    """Reboot the modem and/or router."""
+    require_home()
+    if not (modem or router or all_devs):
         modem = True
-
+    failed = False
     if modem or all_devs:
-        console.print("Rebooting 5G Modem (192.168.118.1)...")
         try:
             with ModemClient() as m:
-                if m.reboot():
-                    console.print("[green]5G Modem reboot command accepted.[/green]")
-                else:
-                    console.print("[red]Failed to reboot modem.[/red]")
+                accepted = m.reboot()
+            console.print("[green]Modem is rebooting.[/green]" if accepted else "[red]Modem refused the reboot.[/red]")
+            failed |= not accepted
         except Exception as e:
-            console.print(f"[red]Error rebooting modem: {e}[/red]")
-
+            console.print(f"[red]Modem: {e}[/red]")
+            failed = True
     if router or all_devs:
-        console.print("Rebooting Wi-Fi Router (192.168.3.1)...")
+        if not settings.router_configured:
+            fail("ROUTER_URL is not set.")
         try:
             with RouterClient() as r:
-                if r.reboot():
-                    console.print("[green]Wi-Fi Router reboot command accepted.[/green]")
-                else:
-                    console.print("[red]Failed to reboot router.[/red]")
+                accepted = r.reboot()
+            console.print("[green]Router is rebooting.[/green]" if accepted else "[red]Router refused the reboot.[/red]")
+            failed |= not accepted
         except Exception as e:
-            console.print(f"[red]Error rebooting router: {e}[/red]")
+            console.print(f"[red]Router: {e}[/red]")
+            failed = True
+    if failed:
+        raise typer.Exit(1)
+
+
+@sms_app.command("list")
+def sms_list(
+    count: Annotated[int, typer.Option("--count", "-c")] = 10,
+    page: Annotated[int, typer.Option("--page", "-p")] = 1,
+):
+    """Show the SMS inbox (data balance alerts, bundle expiry, ...)."""
+    require_home()
+    try:
+        with ModemClient() as m:
+            unread, inbox, max_m = m.sms_counts()
+            messages = m.sms_list(page=page, count=count)
+    except ModemError as e:
+        fail(str(e))
+    console.print(f"[bold]Inbox:[/bold] {inbox}/{max_m} ({unread} unread)\n")
+    if not messages:
+        console.print("[yellow]No messages.[/yellow]")
+        return
+    t = Table(show_header=True, header_style="bold green")
+    t.add_column("Date", style="dim", no_wrap=True)
+    t.add_column("From", style="cyan", no_wrap=True)
+    t.add_column("")
+    t.add_column("Message")
+    for msg in messages:
+        t.add_row(msg.date, msg.phone, "[bold red]new[/bold red]" if msg.is_unread else "", msg.content.strip())
+    console.print(t)
+
+
+@sms_app.command("send")
+def sms_send(
+    phone: Annotated[str, typer.Argument(help="Recipient number")],
+    message: Annotated[str, typer.Argument(help="Message text")],
+):
+    """Send an SMS."""
+    require_home()
+    try:
+        with ModemClient() as m:
+            if not m.sms_send(phone, message):
+                fail("Modem didn't accept the SMS.")
+    except ModemError as e:
+        fail(str(e))
+    console.print("[green]Sent.[/green]")
 
 
 @app.command()
-def fix():
-    console.print("[bold]Running offline auto-diagnose and auto-fix...[/bold]")
-    wd = Watchdog()
-    diag = wd.diagnose()
-
-    if not diag.is_target_network:
-        console.print("[yellow]Not currently connected to target Wi-Fi network. Skipping.[/yellow]")
-        return
-
-    if diag.has_internet:
-        console.print("[green]Connection is healthy! Internet is flowing normally.[/green]")
-        return
-
-    console.print(f"[bold red]Connection issue detected! Recommended action: {diag.recommended_action.value}[/bold red]")
-    result = wd.autofix(diag)
-    if result.success:
-        console.print("[bold green]Network connection successfully restored![/bold green]")
-    else:
-        console.print("[bold red]Autofix sequence completed but connection has not yet recovered.[/bold red]")
+def ussd(
+    code: Annotated[str, typer.Argument(help="USSD code, e.g. your carrier's data balance code")],
+    timeout: Annotated[int, typer.Option("--timeout", "-t")] = 25,
+):
+    """Run a USSD code through the modem's SIM, e.g. to check your data balance."""
+    require_home()
+    try:
+        with ModemClient() as m:
+            res = m.ussd_send(code, timeout_seconds=timeout)
+    except ModemError as e:
+        fail(str(e))
+    console.print(Panel(res, title=code, border_style="cyan"))
 
 
 @app.command()
 def daemon(
-    install: Annotated[bool, typer.Option("--install", "-i", help="Install macOS background LaunchAgent service")] = False,
-    uninstall: Annotated[bool, typer.Option("--uninstall", "-u", help="Uninstall macOS background service")] = False,
-    service_status: Annotated[bool, typer.Option("--status", "-s", help="Check background service status")] = False,
+    install: Annotated[bool, typer.Option("--install", "-i", help="Install as a background service that starts at login")] = False,
+    uninstall: Annotated[bool, typer.Option("--uninstall", "-u", help="Remove the background service")] = False,
+    service_status: Annotated[bool, typer.Option("--status", "-s", help="Show whether the service is running")] = False,
+    dry_run: Annotated[bool, typer.Option("--dry-run", help="Watch and log, but never touch devices")] = False,
 ):
-    plist_path = Path.home() / "Library" / "LaunchAgents" / "com.user.wifi-helper.plist"
-    repo_dir = Path(__file__).resolve().parent.parent.parent
-    venv_bin = repo_dir / ".venv" / "bin" / "wifi"
-    log_path = repo_dir / "daemon.log"
-
+    """Watch the connection and heal it automatically."""
     if install:
-        plist_content = f"""<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-    <key>Label</key>
-    <string>com.user.wifi-helper</string>
-    <key>ProgramArguments</key>
-    <array>
-        <string>{venv_bin}</string>
-        <string>daemon</string>
-    </array>
-    <key>WorkingDirectory</key>
-    <string>{repo_dir}</string>
-    <key>RunAtLoad</key>
-    <true/>
-    <key>KeepAlive</key>
-    <true/>
-    <key>StandardOutPath</key>
-    <string>{log_path}</string>
-    <key>StandardErrorPath</key>
-    <string>{log_path}</string>
-</dict>
-</plist>
-"""
-        plist_path.parent.mkdir(parents=True, exist_ok=True)
-        plist_path.write_text(plist_content)
-        subprocess.run(["launchctl", "unload", str(plist_path)], capture_output=True)
-        res = subprocess.run(["launchctl", "load", str(plist_path)], capture_output=True, text=True)
-        if res.returncode == 0:
-            console.print(f"[green]Successfully installed and loaded service:[/green] {plist_path}")
-            console.print(f"[dim]Logs: {log_path}[/dim]")
-        else:
-            console.print(f"[red]Failed to load launchd service: {res.stderr}[/red]")
-        return
-
+        if not ENV_FILE:
+            fail("No .env found. Create one first (see `wifi config`).")
+        res = service.install()
+        console.print(f"[green]Installed:[/green] {res.message}\n[dim]Log: {service.log_path()}[/dim]" if res.ok else f"[red]{res.message}[/red]")
+        raise typer.Exit(0 if res.ok else 1)
     if uninstall:
-        if plist_path.exists():
-            subprocess.run(["launchctl", "unload", str(plist_path)], capture_output=True)
-            plist_path.unlink()
-            console.print(f"[green]Uninstalled service:[/green] {plist_path}")
-        else:
-            console.print("[yellow]Service plist does not exist.[/yellow]")
-        return
-
+        res = service.uninstall()
+        console.print(res.message)
+        raise typer.Exit(0 if res.ok else 1)
     if service_status:
-        res = subprocess.run(["launchctl", "list"], capture_output=True, text=True)
-        matching = [line for line in res.stdout.splitlines() if "com.user.wifi-helper" in line]
-        if matching:
-            console.print(f"[green]Service is active:[/green] {matching[0]}")
-            if log_path.exists():
-                console.print(f"[dim]Recent log output ({log_path}):[/dim]")
-                tail = subprocess.run(["tail", "-n", "5", str(log_path)], capture_output=True, text=True)
-                console.print(tail.stdout)
-        else:
-            console.print("[yellow]Service is not currently running in launchctl.[/yellow]")
+        res = service.status()
+        console.print(f"[green]running[/green] {res.message}" if res.ok else f"[yellow]{res.message}[/yellow]")
+        log = service.log_path()
+        if log.exists():
+            console.print(f"[dim]{log}:[/dim]")
+            console.print("\n".join(log.read_text().splitlines()[-8:]))
         return
+    Watchdog(settings, dry_run=dry_run).run()
 
-    wd = Watchdog()
-    wd.run_daemon()
+
+@app.command("history")
+def history_cmd(limit: Annotated[int, typer.Option("--limit", "-n", help="Recent outages to list")] = 15):
+    """Outages the watchdog has seen: how often, how long, what fixed them, what time of day."""
+    incidents = history.load()
+    if not incidents:
+        console.print(f"No outages recorded yet ({history.incidents_path()}).")
+        return
+    t = Table(title="Recent outages", header_style="bold")
+    for col in ("Started", "Down", "Cause", "Tried", "Fixed by"):
+        t.add_column(col)
+    for i in incidents[-limit:]:
+        t.add_row(i.started.replace("T", " ")[:16], f"{i.duration_s or 0:.0f}s", i.verdict, ", ".join(i.actions) or "-", i.recovered_by or "-")
+    console.print(t)
+
+    s = history.summarize(incidents)
+    console.print(
+        f"\n[bold]{s.count}[/bold] outages, [bold]{s.total_down_s / 60:.0f} min[/bold] total downtime, "
+        f"median [bold]{s.median_down_s:.0f}s[/bold]"
+    )
+    console.print("Causes:   " + ", ".join(f"{k} {v}" for k, v in s.by_verdict.most_common()))
+    console.print("Fixed by: " + ", ".join(f"{k} {v}" for k, v in s.by_fix.most_common()))
+    if s.by_hour:
+        peak = max(s.by_hour.values())
+        console.print("\nOutages by hour of day:")
+        for hour in range(24):
+            n = s.by_hour.get(hour, 0)
+            if n:
+                console.print(f"  {hour:02d}:00 {'█' * max(1, round(20 * n / peak))} {n}")
+
+
+@app.command()
+def config():
+    """Show which settings file is in use and what's configured (passwords hidden)."""
+    console.print(f"Settings file: [bold]{ENV_FILE or 'none found'}[/bold]")
+    if not ENV_FILE:
+        console.print("Looked in: " + ", ".join(str(p) for p in env_candidates()))
+    t = Table(show_header=False)
+    t.add_column(style="dim")
+    t.add_column()
+    t.add_row("MODEM_URL", settings.modem_url)
+    t.add_row("MODEM_USER / PASSWORD", f"{settings.modem_user} / {'set' if settings.modem_password else '[red]missing[/red]'}")
+    t.add_row("ROUTER_URL", settings.router_url or "[dim]none (modem is the Wi-Fi)[/dim]")
+    if settings.router_configured:
+        t.add_row("ROUTER_USER / PASSWORD", f"{settings.router_user} / {'set' if settings.router_password else '[red]missing[/red]'}")
+    t.add_row("Home gateways", ", ".join(settings.home_gateways))
+    t.add_row("HOME_GATEWAY_MAC", settings.home_gateway_mac or "[yellow]not pinned[/yellow]")
+    t.add_row("ALLOWED_SSIDS", ", ".join(settings.allowed_ssids) or "[dim]any[/dim]")
+    t.add_row("Check every", f"{settings.check_interval}s, act after {settings.offline_checks_before_fix} failed checks")
+    t.add_row("Reboot cooldown", f"{settings.reboot_cooldown}s")
+    console.print(t)
 
 
 def main():
-    app()
-
-
-if __name__ == "__main__":
-    main()
+    try:
+        app()
+    except AuthError as e:
+        console.print(f"[red]Login failed: {e}[/red]")
+        sys.exit(1)

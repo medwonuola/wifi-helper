@@ -3,6 +3,7 @@ import re
 import httpx
 from .config import settings
 from .crypto import generate_nonce, scram_calculate
+from .modem import AuthError
 
 
 @dataclass(frozen=True)
@@ -29,9 +30,9 @@ class RouterClient:
         self.client = httpx.Client(base_url=self.base_url, timeout=timeout)
         self.csrf_param: str = ""
         self.csrf_token: str = ""
+        self.logged_in = False
 
     def __enter__(self):
-        self.login()
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
@@ -42,7 +43,17 @@ class RouterClient:
             self.csrf_param = data["csrf_param"]
             self.csrf_token = data["csrf_token"]
 
-    def login(self) -> bool:
+    def login(self) -> None:
+        """Log in or raise AuthError."""
+        if self.logged_in:
+            return
+        if not self.password:
+            raise AuthError("ROUTER_PASSWORD is not set")
+        if not self._login():
+            raise AuthError("router login failed (wrong password, or a different router model)")
+        self.logged_in = True
+
+    def _login(self) -> bool:
         try:
             r_index = self.client.get("/html/index.html")
             m_param = re.search(r'name="csrf_param"\s+content="([^"]+)"', r_index.text)
@@ -116,6 +127,7 @@ class RouterClient:
         return r
 
     def status(self) -> RouterStatus:
+        self.login()
         r_dev = self.get("/api/system/deviceinfo").json()
         r_wan = self.get("/api/ntwk/wan").json()
         r_hosts = self.get("/api/system/HostInfo").json()
@@ -124,7 +136,7 @@ class RouterClient:
         wan_entry = r_wan[0] if isinstance(r_wan, list) and r_wan else {}
 
         return RouterStatus(
-            device_name=r_dev.get("custinfo", {}).get("CustZHFriendlyName", "Huawei AX3"),
+            device_name=r_dev.get("custinfo", {}).get("CustZHFriendlyName", "Huawei router"),
             harmony_version=r_dev.get("HarmonyOSVersion", "Unknown"),
             wan_ip=wan_entry.get("IPv4Addr", ""),
             wan_gateway=wan_entry.get("IPv4Gateway", ""),
@@ -133,6 +145,7 @@ class RouterClient:
         )
 
     def reboot(self) -> bool:
+        self.login()
         r = self.post("/api/system/delayreboot", {})
         data = r.json()
         return data.get("errcode", -1) == 0 or data.get("err", -1) == 0
