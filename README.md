@@ -62,7 +62,8 @@ The carrier DNS probe is the key one. The modem reports which DNS servers the ca
 | `dead_bearer` | Modem "connected", nothing flows | Restart mobile data (twice max), then reboot modem once |
 | `modem_disconnected` | Signal, but no data session | Same as above |
 | `upstream_down` | Carrier reachable, internet not | Restart mobile data once |
-| `modem_unreachable` | Router fine, modem not answering | Reboot router once (if configured) |
+| `modem_connecting` | Modem still connecting (normal after power-up or a data restart) | Wait 3 minutes, then treat as disconnected |
+| `modem_unreachable` | Router fine, modem not answering | Wait 5 minutes (it's usually the modem rebooting), then reboot router once |
 | `no_signal` | No signal or SIM problem | None; a reboot can't fix this |
 | `redirected` | Web redirected (often: data bundle exhausted) | None; check your balance (`wifi ussd`) |
 | `vpn_problem` | Cellular fine, VPN not | None |

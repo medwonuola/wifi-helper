@@ -20,6 +20,7 @@ class Verdict(str, Enum):
     LAN_DOWN = "lan_down"
     MODEM_UNREACHABLE = "modem_unreachable"
     NO_SIGNAL = "no_signal"
+    MODEM_CONNECTING = "modem_connecting"
     MODEM_DISCONNECTED = "modem_disconnected"
     DEAD_BEARER = "dead_bearer"
     VPN_PROBLEM = "vpn_problem"
@@ -42,6 +43,7 @@ EXPLANATIONS = {
     Verdict.LAN_DOWN: "This computer can't reach its own gateway. Check the Wi-Fi connection on this device.",
     Verdict.MODEM_UNREACHABLE: "The router is up but the modem doesn't answer. The router-to-modem link or the modem itself is stuck.",
     Verdict.NO_SIGNAL: "The modem has no usable signal or SIM. Restarting won't help; check SIM, coverage, or wait for the tower.",
+    Verdict.MODEM_CONNECTING: "The modem is still connecting (normal for a minute or two after power-up or a data restart). Waiting before doing anything.",
     Verdict.MODEM_DISCONNECTED: "The modem has signal but no data session.",
     Verdict.DEAD_BEARER: "The modem says 'connected' but nothing crosses the cellular link (the carrier's own DNS is silent). The data session is stale.",
     Verdict.VPN_PROBLEM: "The cellular link works (the carrier answers) but traffic through your VPN doesn't. The VPN is the problem, not the modem.",
@@ -76,16 +78,22 @@ def classify(s: Snapshot) -> Verdict:
         return Verdict.NOT_HOME
     if s.http == "ok":
         return Verdict.ONLINE
-    if s.router_reachable is False:
+    # The modem is behind the router, so reaching it proves the router works even
+    # when the router's own web page is too busy to answer.
+    if s.router_reachable is False and not s.modem_reachable:
         return Verdict.LAN_DOWN
     if s.modem_reachable is False:
         return Verdict.LAN_DOWN if s.router_reachable is None else Verdict.MODEM_UNREACHABLE
     if s.modem is not None:
         if s.modem.sim_ok is False or (not s.modem.connected and s.modem.signal_bars == 0):
             return Verdict.NO_SIGNAL
+        if s.modem.connection_status == "900":
+            return Verdict.MODEM_CONNECTING
         if not s.modem.connected:
             return Verdict.MODEM_DISCONNECTED
-    if s.http == "redirect":
+    # A redirect only means a portal (e.g. out of data) if the carrier is reachable.
+    # With the link down, Huawei devices serve their own "no internet" page instead.
+    if s.http == "redirect" and (s.ip_ok or s.bearer_ok):
         return Verdict.REDIRECTED
     if s.bearer_ok is False:
         return Verdict.DEAD_BEARER
@@ -130,6 +138,12 @@ class IncidentState:
 MAX_CYCLES = {Verdict.MODEM_DISCONNECTED: 2, Verdict.DEAD_BEARER: 2, Verdict.UPSTREAM_DOWN: 1}
 CAN_REBOOT_MODEM = {Verdict.MODEM_DISCONNECTED, Verdict.DEAD_BEARER}
 
+# A modem reports "connecting" for a while after power-up or a data restart. Leave it alone.
+CONNECTING_GRACE = 180
+SETTLE_AFTER_ACTION = 120
+# An unreachable modem is usually the modem rebooting. Only blame the router after this long.
+MODEM_UNREACHABLE_GRACE = 300
+
 
 def choose_action(
     verdict: Verdict,
@@ -139,10 +153,22 @@ def choose_action(
     last_reboot_at: float,
     reboot_cooldown: int,
     now: float,
+    outage_seconds: float = 0.0,
 ) -> Action:
     reboot_allowed = now - last_reboot_at >= reboot_cooldown
+    since_action = now - incident.last_action_at if incident.actions else float("inf")
+    if verdict == Verdict.MODEM_CONNECTING:
+        if outage_seconds < CONNECTING_GRACE or since_action < SETTLE_AFTER_ACTION:
+            return Action.NONE
+        verdict = Verdict.MODEM_DISCONNECTED  # stuck connecting: treat as disconnected
     if verdict == Verdict.MODEM_UNREACHABLE:
-        if router_configured and incident.router_reboots == 0 and reboot_allowed:
+        if (
+            router_configured
+            and incident.router_reboots == 0
+            and reboot_allowed
+            and outage_seconds >= MODEM_UNREACHABLE_GRACE
+            and since_action >= MODEM_UNREACHABLE_GRACE
+        ):
             return Action.REBOOT_ROUTER
         return Action.NONE
     if incident.cycles < MAX_CYCLES.get(verdict, 0):
@@ -175,8 +201,8 @@ def full_check(settings: Settings, snap: Snapshot | None = None) -> Snapshot:
     snap.dns_ok = net.system_dns_ok()
 
     if settings.router_configured and settings.router_host != settings.modem_host:
-        snap.router_reachable = net.tcp_reachable(settings.router_host, 80)
-    snap.modem_reachable = net.tcp_reachable(settings.modem_host, 80)
+        snap.router_reachable = net.tcp_reachable(settings.router_host, 80, timeout=3.0)
+    snap.modem_reachable = net.tcp_reachable(settings.modem_host, 80, timeout=3.0)
 
     if snap.modem_reachable:
         try:

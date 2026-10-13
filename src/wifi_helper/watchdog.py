@@ -98,13 +98,17 @@ class Watchdog:
         incident: history.Incident,
         state: IncidentState,
         on_step: Callable[[Snapshot, Verdict], None] | None = None,
+        started: float | None = None,
     ) -> bool:
         """Diagnose and fix until online, out of options, or we leave the home network."""
+        started = time.monotonic() if started is None else started
         verdict = classify(snap)
         if snap.modem and incident.modem is None:
             incident.modem = asdict(snap.modem)
         while True:
             if not incident.verdicts or incident.verdicts[-1] != verdict.value:
+                if incident.verdicts:
+                    log(f"Now: {verdict.value}")
                 incident.verdicts.append(verdict.value)
             if on_step:
                 on_step(snap, verdict)
@@ -119,6 +123,7 @@ class Watchdog:
                 last_reboot_at=self.last_reboot_at,
                 reboot_cooldown=self.settings.reboot_cooldown,
                 now=time.time(),
+                outage_seconds=time.monotonic() - started,
             )
             if action == Action.NONE:
                 return False
@@ -188,7 +193,7 @@ class Watchdog:
                     log(f"[bold red]Offline: {verdict.value}[/bold red] {EXPLANATIONS[verdict]}")
                 elif outage.state.exhausted_for(s.reboot_cooldown):
                     outage.state = IncidentState()  # long outage: allow the ladder again
-                if self.heal(snap, outage.incident, outage.state):
+                if self.heal(snap, outage.incident, outage.state, started=outage.t0):
                     outage.close(outage.incident.recovered_by)
                     offline_streak, outage, first_fail = 0, None, None
             except KeyboardInterrupt:

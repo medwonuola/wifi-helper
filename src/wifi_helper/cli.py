@@ -111,11 +111,13 @@ def fix(dry_run: Annotated[bool, typer.Option("--dry-run", help="Show what would
             seen.append(v)
             console.print(f"[bold]{v.value}[/bold]: {EXPLANATIONS[v]}")
 
-    recovered = wd.heal(snap, outage.incident, outage.state, on_step)
+    recovered = wd.heal(snap, outage.incident, outage.state, on_step, started=outage.t0)
     if not dry_run:
         outage.close(outage.incident.recovered_by if recovered else "not recovered")
     if recovered:
         console.print("[bold green]Internet is back.[/bold green]")
+    elif seen and seen[-1] == Verdict.MODEM_CONNECTING:
+        fail("The modem is still connecting. Give it a minute or two, then run `wifi fix` again if it's still down.")
     else:
         fail("Out of safe automatic fixes. See the explanation above.")
 
