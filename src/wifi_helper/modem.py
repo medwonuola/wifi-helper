@@ -40,6 +40,7 @@ LOGIN_ERRORS = (
     LoginErrorUsernamePasswordModifyException,
 )
 USSD_PENDING = 111019
+SMS_PAGE_MAX = 50
 
 
 class ModemError(Exception):
@@ -152,6 +153,10 @@ def sms_counts(c: Client) -> tuple[int, int, int]:
 
 def sms_list(c: Client, page: int, count: int) -> list[Message]:
     return [Message.from_dict(m) for m in c.sms.get_sms_list(page, read_count=count)["Messages"]["Message"]]
+
+
+def sms_all(c: Client) -> list[Message]:
+    return list(c.sms.get_messages(read_count=SMS_PAGE_MAX))
 
 
 def ussd(c: Client, code: str, timeout: float) -> str:

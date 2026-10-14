@@ -208,12 +208,13 @@ def reboot(
 
 @sms_app.command("list", help="Show the SMS inbox (data balance alerts, bundle expiry, ...).")
 def sms_list(
-    count: Annotated[int, typer.Option("--count", "-c")] = 10,
-    page: Annotated[int, typer.Option("--page", "-p")] = 1,
+    count: Annotated[int, typer.Option("--count", "-c", min=1, max=modem.SMS_PAGE_MAX)] = 10,
+    page: Annotated[int, typer.Option("--page", "-p", min=1)] = 1,
+    all_messages: Annotated[bool, typer.Option("--all", "-a", help="Every message in the inbox")] = False,
 ):
     with modem_session() as c:
         unread, inbox, max_m = modem.sms_counts(c)
-        messages = modem.sms_list(c, page, count)
+        messages = modem.sms_all(c) if all_messages else modem.sms_list(c, page, count)
     console.print(f"[bold]Inbox:[/bold] {inbox}/{max_m} ({unread} unread)\n")
     if not messages:
         console.print("[yellow]No messages.[/yellow]")

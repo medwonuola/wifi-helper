@@ -108,7 +108,7 @@ Pin `HOME_GATEWAY_MAC`. Huawei routers all default to the same addresses, so wit
 | `wifi status` | Carrier, 4G/5G, signal, speed, data used, SMS count, router clients. |
 | `wifi cycle` | Restart mobile data. |
 | `wifi reboot [--router] [--all]` | Reboot the modem (default), the router, or both. |
-| `wifi sms list` / `wifi sms send NUMBER TEXT` | Read data-bundle alerts, send SMS. |
+| `wifi sms list [--all]` / `wifi sms send NUMBER TEXT` | Read data-bundle alerts (latest 10, or every message), send SMS. |
 | `wifi ussd CODE` | Run a USSD code (e.g. your carrier's data balance code). |
 | `wifi daemon [--dry-run]` | Watch and heal in the foreground. |
 | `wifi daemon --install / --uninstall / --status` | Run at login (launchd on macOS, systemd user service on Linux). |
