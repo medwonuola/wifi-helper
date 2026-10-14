@@ -1,151 +1,99 @@
 from dataclasses import dataclass
+import hashlib
+import hmac
 import re
-import httpx
-from .config import settings
-from .crypto import generate_nonce, scram_calculate
-from .modem import AuthError
+import secrets
+from typing import Any
+import requests
+from .config import Settings
+
+
+class RouterError(Exception):
+    pass
+
+
+def scram_proof(password: str, salt_hex: str, iterations: int, auth_msg: str) -> str:
+    salted = hashlib.pbkdf2_hmac("sha256", password.encode(), bytes.fromhex(salt_hex), iterations)
+    client_key = hmac.digest(b"Client Key", salted, "sha256")
+    signature = hmac.digest(auth_msg.encode(), hashlib.sha256(client_key).digest(), "sha256")
+    return bytes(a ^ b for a, b in zip(client_key, signature)).hex()
 
 
 @dataclass(frozen=True)
 class RouterStatus:
     device_name: str
-    harmony_version: str
+    firmware: str
     wan_ip: str
     wan_gateway: str
     wan_status: str
-    active_hosts_count: int
+    active_hosts: int
 
 
 class RouterClient:
-    def __init__(
-        self,
-        base_url: str = settings.router_url,
-        username: str = settings.router_user,
-        password: str = settings.router_password,
-        timeout: float = 15.0,
-    ):
-        self.base_url = base_url.rstrip("/")
-        self.username = username
-        self.password = password
-        self.client = httpx.Client(base_url=self.base_url, timeout=timeout)
-        self.csrf_param: str = ""
-        self.csrf_token: str = ""
-        self.logged_in = False
+    def __init__(self, s: Settings, timeout: float = 15.0):
+        self.url, self.username, self.password, self.timeout = s.router_url, s.router_user, s.router_password, timeout
+        self.http = requests.Session()
+        self.http.headers.update({"_ResponseFormat": "JSON", "X-Requested-With": "XMLHttpRequest"})
+        self.csrf: dict[str, str] = {}
 
-    def __enter__(self):
+    def __enter__(self) -> "RouterClient":
+        try:
+            self._login()
+        except BaseException:
+            self.http.close()
+            raise
         return self
 
-    def __exit__(self, exc_type, exc_val, exc_tb):
-        self.client.close()
+    def __exit__(self, *exc: object) -> None:
+        self.http.close()
 
-    def _update_csrf(self, data: dict):
-        if "csrf_param" in data and "csrf_token" in data:
-            self.csrf_param = data["csrf_param"]
-            self.csrf_token = data["csrf_token"]
+    def _request(self, path: str, data: dict | None = None) -> requests.Response:
+        try:
+            if data is None:
+                return self.http.get(self.url + path, timeout=self.timeout)
+            return self.http.post(self.url + path, json={"csrf": self.csrf, "data": data}, timeout=self.timeout)
+        except requests.RequestException as e:
+            raise RouterError(f"router: {e}") from e
 
-    def login(self) -> None:
-        """Log in or raise AuthError."""
-        if self.logged_in:
-            return
+    def _call(self, path: str, data: dict | None = None) -> Any:
+        try:
+            body = self._request(path, data).json()
+        except requests.JSONDecodeError as e:
+            raise RouterError("router sent a non-JSON reply (still booting?)") from e
+        if isinstance(body, dict) and "csrf_token" in body:
+            self.csrf = {"csrf_param": body["csrf_param"], "csrf_token": body["csrf_token"]}
+        return body
+
+    def _login(self) -> None:
         if not self.password:
-            raise AuthError("ROUTER_PASSWORD is not set")
-        if not self._login():
-            raise AuthError("router login failed (wrong password, or a different router model)")
-        self.logged_in = True
-
-    def _login(self) -> bool:
-        try:
-            r_index = self.client.get("/html/index.html")
-            m_param = re.search(r'name="csrf_param"\s+content="([^"]+)"', r_index.text)
-            m_token = re.search(r'name="csrf_token"\s+content="([^"]+)"', r_index.text)
-            if not m_param or not m_token:
-                return False
-
-            self.csrf_param = m_param.group(1)
-            self.csrf_token = m_token.group(1)
-            nonce = generate_nonce()
-
-            payload = {
-                "csrf": {"csrf_param": self.csrf_param, "csrf_token": self.csrf_token},
-                "data": {"username": self.username, "firstnonce": nonce},
-            }
-            headers = {
-                "_ResponseFormat": "JSON",
-                "Content-Type": "application/json; charset=utf-8",
-                "X-Requested-With": "XMLHttpRequest",
-            }
-            r_nonce = self.client.post("/api/system/user_login_nonce", json=payload, headers=headers)
-            nonce_data = r_nonce.json()
-            self._update_csrf(nonce_data)
-
-            salt = nonce_data.get("salt")
-            iters = nonce_data.get("iterations")
-            sn = nonce_data.get("servernonce")
-            if not salt or not iters or not sn:
-                return False
-
-            proof, _ = scram_calculate(self.password, salt, iters, f"{nonce},{sn},{sn}")
-            proof_payload = {
-                "csrf": {"csrf_param": self.csrf_param, "csrf_token": self.csrf_token},
-                "data": {"clientproof": proof, "finalnonce": sn},
-            }
-            r_proof = self.client.post("/api/system/user_login_proof", json=proof_payload, headers=headers)
-            proof_data = r_proof.json()
-            self._update_csrf(proof_data)
-            return proof_data.get("err") == 0
-        except Exception:
-            return False
-
-    def get(self, endpoint: str) -> httpx.Response:
-        headers = {
-            "_ResponseFormat": "JSON",
-            "Content-Type": "application/json; charset=utf-8",
-            "X-Requested-With": "XMLHttpRequest",
-        }
-        r = self.client.get(endpoint, headers=headers)
-        try:
-            self._update_csrf(r.json())
-        except Exception:
-            pass
-        return r
-
-    def post(self, endpoint: str, data: dict) -> httpx.Response:
-        payload = {
-            "csrf": {"csrf_param": self.csrf_param, "csrf_token": self.csrf_token},
-            "data": data,
-        }
-        headers = {
-            "_ResponseFormat": "JSON",
-            "Content-Type": "application/json; charset=utf-8",
-            "X-Requested-With": "XMLHttpRequest",
-        }
-        r = self.client.post(endpoint, json=payload, headers=headers)
-        try:
-            self._update_csrf(r.json())
-        except Exception:
-            pass
-        return r
+            raise RouterError("ROUTER_PASSWORD is not set")
+        page = self._request("/html/index.html").text
+        self.csrf = dict(re.findall(r'name="(csrf_param|csrf_token)"\s+content="([^"]+)"', page))
+        if len(self.csrf) != 2:
+            raise RouterError("unrecognised router login page (a different router model?)")
+        nonce = secrets.token_hex(32)
+        challenge = self._call("/api/system/user_login_nonce", {"username": self.username, "firstnonce": nonce})
+        salt, iterations, server_nonce = (challenge.get(k) for k in ("salt", "iterations", "servernonce"))
+        if not (salt and iterations and server_nonce):
+            raise RouterError("unexpected router login challenge")
+        proof = scram_proof(self.password, salt, iterations, f"{nonce},{server_nonce},{server_nonce}")
+        if self._call("/api/system/user_login_proof", {"clientproof": proof, "finalnonce": server_nonce}).get("err") != 0:
+            raise RouterError("router login failed (wrong password?)")
 
     def status(self) -> RouterStatus:
-        self.login()
-        r_dev = self.get("/api/system/deviceinfo").json()
-        r_wan = self.get("/api/ntwk/wan").json()
-        r_hosts = self.get("/api/system/HostInfo").json()
-
-        active_hosts = len([h for h in r_hosts if isinstance(h, dict) and h.get("Active")])
-        wan_entry = r_wan[0] if isinstance(r_wan, list) and r_wan else {}
-
+        dev = self._call("/api/system/deviceinfo")
+        wans = self._call("/api/ntwk/wan")
+        hosts = self._call("/api/system/HostInfo")
+        wan = wans[0] if wans else {}
         return RouterStatus(
-            device_name=r_dev.get("custinfo", {}).get("CustZHFriendlyName", "Huawei router"),
-            harmony_version=r_dev.get("HarmonyOSVersion", "Unknown"),
-            wan_ip=wan_entry.get("IPv4Addr", ""),
-            wan_gateway=wan_entry.get("IPv4Gateway", ""),
-            wan_status=wan_entry.get("ConnectionStatus", "Unknown"),
-            active_hosts_count=active_hosts,
+            device_name=dev.get("custinfo", {}).get("CustZHFriendlyName", "Huawei router"),
+            firmware=dev.get("HarmonyOSVersion", "unknown"),
+            wan_ip=wan.get("IPv4Addr", ""),
+            wan_gateway=wan.get("IPv4Gateway", ""),
+            wan_status=wan.get("ConnectionStatus", "unknown"),
+            active_hosts=sum(1 for h in hosts if h.get("Active")),
         )
 
     def reboot(self) -> bool:
-        self.login()
-        r = self.post("/api/system/delayreboot", {})
-        data = r.json()
-        return data.get("errcode", -1) == 0 or data.get("err", -1) == 0
+        res = self._call("/api/system/delayreboot", {})
+        return 0 in (res.get("errcode"), res.get("err"))

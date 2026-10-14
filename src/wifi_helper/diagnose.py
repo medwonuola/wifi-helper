@@ -1,17 +1,10 @@
-"""Find which hop is broken, then pick the least disruptive fix for that hop.
-
-Path:  this computer -> [Wi-Fi router] -> modem -> cell tower / carrier core -> internet
-
-Each probe answers one question about one hop. `classify` and `choose_action`
-are pure functions so the decision logic can be tested without hardware.
-"""
-
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from enum import Enum
 import time
-from . import net
+from . import modem, net
 from .config import Settings
-from .modem import ModemClient, MonitoringStatus
+from .modem import ModemError, MonitoringStatus
 
 
 class Verdict(str, Enum):
@@ -78,8 +71,6 @@ def classify(s: Snapshot) -> Verdict:
         return Verdict.NOT_HOME
     if s.http == "ok":
         return Verdict.ONLINE
-    # The modem is behind the router, so reaching it proves the router works even
-    # when the router's own web page is too busy to answer.
     if s.router_reachable is False and not s.modem_reachable:
         return Verdict.LAN_DOWN
     if s.modem_reachable is False:
@@ -91,8 +82,6 @@ def classify(s: Snapshot) -> Verdict:
             return Verdict.MODEM_CONNECTING
         if not s.modem.connected:
             return Verdict.MODEM_DISCONNECTED
-    # A redirect only means a portal (e.g. out of data) if the carrier is reachable.
-    # With the link down, Huawei devices serve their own "no internet" page instead.
     if s.http == "redirect" and (s.ip_ok or s.bearer_ok):
         return Verdict.REDIRECTED
     if s.bearer_ok is False:
@@ -102,7 +91,6 @@ def classify(s: Snapshot) -> Verdict:
             return Verdict.VPN_PROBLEM
         if s.bearer_ok:
             return Verdict.UPSTREAM_DOWN
-        # Bearer unknown (modem API unavailable): a stale session is the common case.
         return Verdict.DEAD_BEARER
     if not s.dns_ok:
         return Verdict.DNS_BROKEN
@@ -111,15 +99,13 @@ def classify(s: Snapshot) -> Verdict:
 
 @dataclass
 class IncidentState:
-    """What has already been tried during the current outage."""
-
     cycles: int = 0
     modem_reboots: int = 0
     router_reboots: int = 0
     actions: list[str] = field(default_factory=list)
     last_action_at: float = 0.0
 
-    def record(self, action: "Action", now: float | None = None) -> None:
+    def record(self, action: Action, now: float | None = None) -> None:
         self.actions.append(action.value)
         self.last_action_at = time.time() if now is None else now
         if action == Action.CYCLE_DATA:
@@ -130,18 +116,14 @@ class IncidentState:
             self.router_reboots += 1
 
     def exhausted_for(self, seconds: float, now: float | None = None) -> bool:
-        """True once something was tried and nothing has been tried for `seconds`."""
         now = time.time() if now is None else now
         return bool(self.actions) and now - self.last_action_at >= seconds
 
 
 MAX_CYCLES = {Verdict.MODEM_DISCONNECTED: 2, Verdict.DEAD_BEARER: 2, Verdict.UPSTREAM_DOWN: 1}
 CAN_REBOOT_MODEM = {Verdict.MODEM_DISCONNECTED, Verdict.DEAD_BEARER}
-
-# A modem reports "connecting" for a while after power-up or a data restart. Leave it alone.
 CONNECTING_GRACE = 180
 SETTLE_AFTER_ACTION = 120
-# An unreachable modem is usually the modem rebooting. Only blame the router after this long.
 MODEM_UNREACHABLE_GRACE = 300
 
 
@@ -149,7 +131,7 @@ def choose_action(
     verdict: Verdict,
     incident: IncidentState,
     *,
-    router_configured: bool,
+    separate_router: bool,
     last_reboot_at: float,
     reboot_cooldown: int,
     now: float,
@@ -160,10 +142,10 @@ def choose_action(
     if verdict == Verdict.MODEM_CONNECTING:
         if outage_seconds < CONNECTING_GRACE or since_action < SETTLE_AFTER_ACTION:
             return Action.NONE
-        verdict = Verdict.MODEM_DISCONNECTED  # stuck connecting: treat as disconnected
+        verdict = Verdict.MODEM_DISCONNECTED
     if verdict == Verdict.MODEM_UNREACHABLE:
         if (
-            router_configured
+            separate_router
             and incident.router_reboots == 0
             and reboot_allowed
             and outage_seconds >= MODEM_UNREACHABLE_GRACE
@@ -179,43 +161,38 @@ def choose_action(
 
 
 def quick_check(settings: Settings) -> Snapshot:
-    """The cheap check run every interval: are we home, and does the web work?"""
-    home = net.check_home_network(settings)
-    snap = Snapshot(home=home)
-    if home.is_home:
+    snap = Snapshot(home=net.check_home_network(settings))
+    if snap.home.is_home:
         snap.http = net.http_check()
     return snap
 
 
+def _read_modem(settings: Settings) -> tuple[MonitoringStatus | None, str | None]:
+    try:
+        return modem.monitoring_status(settings), None
+    except ModemError as e:
+        return None, str(e)
+
+
 def full_check(settings: Settings, snap: Snapshot | None = None) -> Snapshot:
-    """Probe every hop. Only runs when something is wrong (or on `wifi doctor`)."""
     started = time.monotonic()
     snap = snap or quick_check(settings)
     if not snap.home.is_home:
         return snap
-    if snap.http != "ok":
-        snap.http = net.http_check()
-
-    snap.vpn_iface = net.route_interface("1.1.1.1")
-    snap.ip_ok = net.ip_reachable()
-    snap.dns_ok = net.system_dns_ok()
-
-    if settings.router_configured and settings.router_host != settings.modem_host:
-        snap.router_reachable = net.tcp_reachable(settings.router_host, 80, timeout=3.0)
-    snap.modem_reachable = net.tcp_reachable(settings.modem_host, 80, timeout=3.0)
-
-    if snap.modem_reachable:
-        try:
-            with ModemClient(timeout=6.0) as m:
-                snap.modem = m.monitoring_status()
-        except Exception as e:  # any failure here just means "modem state unknown"
-            snap.modem_error = str(e) or e.__class__.__name__
-
-    if snap.modem and snap.modem.carrier_dns:
-        targets = snap.modem.carrier_dns
-        # If even the carrier's private resolver is routed into a VPN, the probe proves nothing.
-        if not net.is_vpn_interface(net.route_interface(targets[0])):
-            snap.bearer_ok = any(net.dns_server_answers(d) for d in targets)
-
+    with ThreadPoolExecutor() as pool:
+        http = pool.submit(net.http_check) if snap.http != "ok" else None
+        vpn_iface = pool.submit(net.route_interface, "1.1.1.1")
+        ip_ok = pool.submit(net.ip_reachable)
+        dns_ok = pool.submit(net.system_dns_ok)
+        router_ok = pool.submit(net.tcp_reachable, settings.router_host, 80, 3.0) if settings.separate_router else None
+        modem_ok = pool.submit(net.tcp_reachable, settings.modem_host, 80, 3.0)
+        modem_state = pool.submit(_read_modem, settings)
+    snap.http = http.result() if http else snap.http
+    snap.vpn_iface, snap.ip_ok, snap.dns_ok = vpn_iface.result(), ip_ok.result(), dns_ok.result()
+    snap.router_reachable = router_ok.result() if router_ok else None
+    snap.modem_reachable = modem_ok.result()
+    snap.modem, snap.modem_error = modem_state.result()
+    if snap.modem and snap.modem.carrier_dns and not net.is_vpn_interface(net.route_interface(snap.modem.carrier_dns[0])):
+        snap.bearer_ok = any(net.dns_server_answers(d) for d in snap.modem.carrier_dns)
     snap.probe_seconds = time.monotonic() - started
     return snap

@@ -1,14 +1,19 @@
+from collections.abc import Iterator
+from contextlib import contextmanager
+from ipaddress import ip_address
 import sys
 from typing import Annotated, NoReturn
+from huawei_lte_api.Client import Client
+from huawei_lte_api.enums.sms import StatusEnum
 from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
 import typer
-from . import history, net, service
+from . import history, modem, net, service
 from .config import ENV_FILE, env_candidates, settings
 from .diagnose import EXPLANATIONS, Action, IncidentState, Snapshot, Verdict, choose_action, classify, full_check
-from .modem import AuthError, ModemClient, ModemError
-from .router import RouterClient
+from .modem import AuthError, ModemError
+from .router import RouterClient, RouterError
 from .watchdog import Outage, Slept, Watchdog
 
 app = typer.Typer(
@@ -27,6 +32,10 @@ def ok(v: bool | None, yes: str = "yes", no: str = "no") -> str:
     return f"[green]{yes}[/green]" if v else f"[red]{no}[/red]"
 
 
+def bars(n: int) -> str:
+    return "█" * n + "░" * max(0, 5 - n)
+
+
 def fail(msg: str) -> NoReturn:
     console.print(f"[red]{msg}[/red]")
     raise typer.Exit(1)
@@ -38,20 +47,26 @@ def require_home() -> None:
         fail(f"Not on your home network ({home.reason}). Refusing to touch devices. See `wifi config`.")
 
 
-@app.command()
-def doctor():
-    """Check every hop from this computer to the internet and explain what's wrong. Changes nothing."""
-    snap = full_check(settings)
-    verdict = classify(snap)
-    print_snapshot(snap)
-    print_verdict(snap, verdict)
+@contextmanager
+def modem_session() -> Iterator[Client]:
+    require_home()
+    with modem.session(settings) as c:
+        yield c
+
+
+def kv_table(title: str, rows: dict[str, str]) -> Table:
+    t = Table(title=title, show_header=False)
+    t.add_column(style="dim")
+    t.add_column()
+    for k, v in rows.items():
+        t.add_row(k, v)
+    return t
 
 
 def print_snapshot(snap: Snapshot) -> None:
-    t = Table(title="Path check", show_header=True, header_style="bold cyan")
-    t.add_column("Hop")
-    t.add_column("Result")
-    t.add_column("Detail", style="dim")
+    t = Table(title="Path check", header_style="bold cyan")
+    for col, style in (("Hop", None), ("Result", None), ("Detail", "dim")):
+        t.add_column(col, style=style)
     h = snap.home
     t.add_row("Home network", ok(h.is_home), f"gateway {h.gateway or '-'}  mac {h.gateway_mac or '-'}  wifi {h.ssid or 'hidden by OS'}")
     if not h.is_home:
@@ -60,10 +75,8 @@ def print_snapshot(snap: Snapshot) -> None:
     if snap.router_reachable is not None:
         t.add_row("Router", ok(snap.router_reachable, "reachable", "unreachable"), settings.router_host)
     t.add_row("Modem", ok(snap.modem_reachable, "reachable", "unreachable"), settings.modem_host)
-    if snap.modem:
-        m = snap.modem
-        bars = "█" * m.signal_bars + "░" * max(0, 5 - m.signal_bars)
-        t.add_row("Modem says", ok(m.connected, m.connection_label, m.connection_label), f"{bars} {m.network_type}  sim {ok(m.sim_ok, 'ok', 'problem')}")
+    if m := snap.modem:
+        t.add_row("Modem says", ok(m.connected, m.connection_label, m.connection_label), f"{bars(m.signal_bars)} {m.network_type}  sim {ok(m.sim_ok, 'ok', 'problem')}")
         t.add_row(
             "Carrier link",
             ok(snap.bearer_ok, "carrier answers", "carrier silent"),
@@ -82,9 +95,9 @@ def print_snapshot(snap: Snapshot) -> None:
 
 def print_verdict(snap: Snapshot, verdict: Verdict) -> None:
     action = choose_action(
-        verdict, IncidentState(), router_configured=settings.router_configured, last_reboot_at=0, reboot_cooldown=0, now=0
+        verdict, IncidentState(), separate_router=settings.separate_router, last_reboot_at=0, reboot_cooldown=0, now=0
     )
-    color = "green" if verdict == Verdict.ONLINE else "yellow" if verdict == Verdict.NOT_HOME else "red"
+    color = {Verdict.ONLINE: "green", Verdict.NOT_HOME: "yellow"}.get(verdict, "red")
     body = EXPLANATIONS[verdict]
     if action != Action.NONE:
         body += f"\n\n`wifi fix` would start with: [bold]{action.value}[/bold]"
@@ -93,10 +106,15 @@ def print_verdict(snap: Snapshot, verdict: Verdict) -> None:
         console.print(f"[dim]Tip: pin your network by adding HOME_GATEWAY_MAC={snap.home.gateway_mac} to your .env[/dim]")
 
 
-@app.command()
+@app.command(help="Check every hop from this computer to the internet and explain what's wrong. Changes nothing.")
+def doctor():
+    snap = full_check(settings)
+    print_snapshot(snap)
+    print_verdict(snap, classify(snap))
+
+
+@app.command(help="Diagnose and apply the smallest fix that works (cycle data, then reboot).")
 def fix(dry_run: Annotated[bool, typer.Option("--dry-run", help="Show what would be done without doing it")] = False):
-    """Diagnose and apply the smallest fix that works (cycle data, then reboot)."""
-    wd = Watchdog(settings, dry_run=dry_run)
     snap = full_check(settings)
     verdict = classify(snap)
     if verdict in (Verdict.ONLINE, Verdict.NOT_HOME):
@@ -112,7 +130,7 @@ def fix(dry_run: Annotated[bool, typer.Option("--dry-run", help="Show what would
             console.print(f"[bold]{v.value}[/bold]: {EXPLANATIONS[v]}")
 
     try:
-        recovered = wd.heal(snap, outage.incident, outage.state, on_step, started=outage.t0)
+        recovered = Watchdog(settings, dry_run=dry_run).heal(snap, outage.incident, outage.state, on_step, started=outage.t0)
     except Slept:
         fail("The computer slept during the fix. Run `wifi fix` again.")
     if not dry_run:
@@ -125,195 +143,140 @@ def fix(dry_run: Annotated[bool, typer.Option("--dry-run", help="Show what would
         fail("Out of safe automatic fixes. See the explanation above.")
 
 
-@app.command()
-def status():
-    """Signal, network type, data usage, SMS count and connected devices."""
-    require_home()
+def carrier_nat(ip: str) -> bool:
     try:
-        with ModemClient() as m:
-            st = m.status()
-            unread, inbox, max_m = m.sms_counts()
-        mon = st.monitoring
-        t = Table(title=f"Modem ({settings.modem_host})", show_header=False)
-        t.add_column(style="dim")
-        t.add_column()
-        bars = "█" * mon.signal_bars + "░" * max(0, 5 - mon.signal_bars)
-        t.add_row("Carrier", st.operator_name)
-        t.add_row("Network", mon.network_type + (" with 5G NR" if st.nr_active and "5G" not in mon.network_type else ""))
-        t.add_row("Signal", f"{bars} ({mon.signal_bars}/5)")
-        t.add_row("Connection", mon.connection_label)
-        t.add_row("Cellular IP", st.wan_ip + (" (carrier NAT)" if is_cgnat(st.wan_ip) else ""))
-        t.add_row("Carrier DNS", ", ".join(mon.carrier_dns) or "-")
-        t.add_row("Speed now", f"↓ {st.current_download_rate * 8 / 1e6:.1f} Mbps  ↑ {st.current_upload_rate * 8 / 1e6:.1f} Mbps")
-        t.add_row("Data since reset", f"↓ {st.total_download_bytes / 1e9:.2f} GB  ↑ {st.total_upload_bytes / 1e9:.2f} GB")
-        t.add_row("SMS", f"{inbox}/{max_m} ({unread} unread)")
-        console.print(t)
-    except Exception as e:
-        console.print(f"[red]Modem: {e}[/red]")
-
-    if not settings.router_configured or settings.router_host == settings.modem_host:
-        return
-    try:
-        with RouterClient() as r:
-            rst = r.status()
-        t = Table(title=f"Router ({settings.router_host})", show_header=False)
-        t.add_column(style="dim")
-        t.add_column()
-        t.add_row("Model", rst.device_name)
-        t.add_row("Firmware", rst.harmony_version)
-        t.add_row("WAN", f"{rst.wan_ip} via {rst.wan_gateway} ({rst.wan_status})")
-        t.add_row("Active devices", str(rst.active_hosts_count))
-        console.print(t)
-    except Exception as e:
-        console.print(f"[red]Router: {e}[/red]")
-
-
-def is_cgnat(ip: str) -> bool:
-    parts = ip.split(".")
-    if len(parts) != 4 or not all(p.isdigit() for p in parts):
+        return not ip_address(ip).is_global
+    except ValueError:
         return False
-    a, b = int(parts[0]), int(parts[1])
-    return a == 10 or (a == 100 and 64 <= b <= 127) or (a == 172 and 16 <= b <= 31) or (a == 192 and b == 168)
 
 
-@app.command()
+@app.command(help="Signal, network type, data usage, SMS count and connected devices.")
+def status():
+    with modem_session() as c:
+        st = modem.status(c)
+        unread, inbox, max_m = modem.sms_counts(c)
+    mon = st.monitoring
+    console.print(kv_table(f"Modem ({settings.modem_host})", {
+        "Carrier": st.operator_name,
+        "Network": mon.network_type + (" with 5G NR" if st.nr_active and "5G" not in mon.network_type else ""),
+        "Signal": f"{bars(mon.signal_bars)} ({mon.signal_bars}/5)",
+        "Connection": mon.connection_label,
+        "Cellular IP": st.wan_ip + (" (carrier NAT)" if carrier_nat(st.wan_ip) else ""),
+        "Carrier DNS": ", ".join(mon.carrier_dns) or "-",
+        "Speed now": f"↓ {st.download_bps / 1e6:.1f} Mbps  ↑ {st.upload_bps / 1e6:.1f} Mbps",
+        "Data since reset": f"↓ {st.total_download_bytes / 1e9:.2f} GB  ↑ {st.total_upload_bytes / 1e9:.2f} GB",
+        "SMS": f"{inbox}/{max_m} ({unread} unread)",
+    }))
+    if not settings.separate_router:
+        return
+    with RouterClient(settings) as r:
+        rst = r.status()
+    console.print(kv_table(f"Router ({settings.router_host})", {
+        "Model": rst.device_name,
+        "Firmware": rst.firmware,
+        "WAN": f"{rst.wan_ip} via {rst.wan_gateway} ({rst.wan_status})",
+        "Active devices": str(rst.active_hosts),
+    }))
+
+
+@app.command(help="Turn mobile data off and on (fast fix, ~10-30s, Wi-Fi stays up).")
 def cycle():
-    """Turn mobile data off and on (fast fix, ~10-30s, Wi-Fi stays up)."""
-    require_home()
-    try:
-        with ModemClient() as m:
-            if not m.cycle_data():
-                fail("Modem didn't accept the data switch.")
-        console.print("[green]Data connection restarted.[/green]")
-    except ModemError as e:
-        fail(str(e))
+    with modem_session() as c:
+        if not modem.cycle_data(c):
+            fail("Modem didn't accept the data switch.")
+    console.print("[green]Data connection restarted.[/green]")
 
 
-@app.command()
+@app.command(help="Reboot the modem and/or router.")
 def reboot(
-    modem: Annotated[bool, typer.Option("--modem", "-m", help="Reboot the modem (default)")] = False,
-    router: Annotated[bool, typer.Option("--router", "-r", help="Reboot the Wi-Fi router")] = False,
+    router: Annotated[bool, typer.Option("--router", "-r", help="Reboot the Wi-Fi router instead of the modem")] = False,
     all_devs: Annotated[bool, typer.Option("--all", "-a", help="Reboot both")] = False,
 ):
-    """Reboot the modem and/or router."""
-    require_home()
-    if not (modem or router or all_devs):
-        modem = True
-    failed = False
-    if modem or all_devs:
-        try:
-            with ModemClient() as m:
-                accepted = m.reboot()
-            console.print("[green]Modem is rebooting.[/green]" if accepted else "[red]Modem refused the reboot.[/red]")
-            failed |= not accepted
-        except Exception as e:
-            console.print(f"[red]Modem: {e}[/red]")
-            failed = True
-    if router or all_devs:
-        if not settings.router_configured:
+    if all_devs or not router:
+        with modem_session() as c:
+            if not modem.reboot(c):
+                fail("Modem refused the reboot.")
+        console.print("[green]Modem is rebooting.[/green]")
+    if all_devs or router:
+        if not settings.separate_router:
             fail("ROUTER_URL is not set.")
-        try:
-            with RouterClient() as r:
-                accepted = r.reboot()
-            console.print("[green]Router is rebooting.[/green]" if accepted else "[red]Router refused the reboot.[/red]")
-            failed |= not accepted
-        except Exception as e:
-            console.print(f"[red]Router: {e}[/red]")
-            failed = True
-    if failed:
-        raise typer.Exit(1)
+        with RouterClient(settings) as r:
+            if not r.reboot():
+                fail("Router refused the reboot.")
+        console.print("[green]Router is rebooting.[/green]")
 
 
-@sms_app.command("list")
+@sms_app.command("list", help="Show the SMS inbox (data balance alerts, bundle expiry, ...).")
 def sms_list(
     count: Annotated[int, typer.Option("--count", "-c")] = 10,
     page: Annotated[int, typer.Option("--page", "-p")] = 1,
 ):
-    """Show the SMS inbox (data balance alerts, bundle expiry, ...)."""
-    require_home()
-    try:
-        with ModemClient() as m:
-            unread, inbox, max_m = m.sms_counts()
-            messages = m.sms_list(page=page, count=count)
-    except ModemError as e:
-        fail(str(e))
+    with modem_session() as c:
+        unread, inbox, max_m = modem.sms_counts(c)
+        messages = modem.sms_list(c, page, count)
     console.print(f"[bold]Inbox:[/bold] {inbox}/{max_m} ({unread} unread)\n")
     if not messages:
         console.print("[yellow]No messages.[/yellow]")
         return
-    t = Table(show_header=True, header_style="bold green")
+    t = Table(header_style="bold green")
     t.add_column("Date", style="dim", no_wrap=True)
     t.add_column("From", style="cyan", no_wrap=True)
     t.add_column("")
     t.add_column("Message")
     for msg in messages:
-        t.add_row(msg.date, msg.phone, "[bold red]new[/bold red]" if msg.is_unread else "", msg.content.strip())
+        new = "[bold red]new[/bold red]" if msg.status == StatusEnum.NEW else ""
+        t.add_row(f"{msg.date_time:%Y-%m-%d %H:%M}", msg.phone, new, msg.content.strip())
     console.print(t)
 
 
-@sms_app.command("send")
+@sms_app.command("send", help="Send an SMS.")
 def sms_send(
     phone: Annotated[str, typer.Argument(help="Recipient number")],
     message: Annotated[str, typer.Argument(help="Message text")],
 ):
-    """Send an SMS."""
-    require_home()
-    try:
-        with ModemClient() as m:
-            if not m.sms_send(phone, message):
-                fail("Modem didn't accept the SMS.")
-    except ModemError as e:
-        fail(str(e))
+    with modem_session() as c:
+        if c.sms.send_sms([phone], message) != "OK":
+            fail("Modem didn't accept the SMS.")
     console.print("[green]Sent.[/green]")
 
 
-@app.command()
+@app.command(help="Run a USSD code through the modem's SIM, e.g. to check your data balance.")
 def ussd(
     code: Annotated[str, typer.Argument(help="USSD code, e.g. your carrier's data balance code")],
     timeout: Annotated[int, typer.Option("--timeout", "-t")] = 25,
 ):
-    """Run a USSD code through the modem's SIM, e.g. to check your data balance."""
-    require_home()
-    try:
-        with ModemClient() as m:
-            res = m.ussd_send(code, timeout_seconds=timeout)
-    except ModemError as e:
-        fail(str(e))
+    with modem_session() as c:
+        res = modem.ussd(c, code, timeout)
     console.print(Panel(res, title=code, border_style="cyan"))
 
 
-@app.command()
+@app.command(help="Watch the connection and heal it automatically.")
 def daemon(
     install: Annotated[bool, typer.Option("--install", "-i", help="Install as a background service that starts at login")] = False,
     uninstall: Annotated[bool, typer.Option("--uninstall", "-u", help="Remove the background service")] = False,
     service_status: Annotated[bool, typer.Option("--status", "-s", help="Show whether the service is running")] = False,
     dry_run: Annotated[bool, typer.Option("--dry-run", help="Watch and log, but never touch devices")] = False,
 ):
-    """Watch the connection and heal it automatically."""
-    if install:
-        if not ENV_FILE:
-            fail("No .env found. Create one first (see `wifi config`).")
-        res = service.install()
-        console.print(f"[green]Installed:[/green] {res.message}\n[dim]Log: {service.log_path()}[/dim]" if res.ok else f"[red]{res.message}[/red]")
-        raise typer.Exit(0 if res.ok else 1)
-    if uninstall:
-        res = service.uninstall()
-        console.print(res.message)
+    if install and not ENV_FILE:
+        fail("No .env found. Create one first (see `wifi config`).")
+    if install or uninstall:
+        res = service.install() if install else service.uninstall()
+        console.print(f"[green]{res.message}[/green]" if res.ok else f"[red]{res.message}[/red]")
+        if res.ok and install:
+            console.print(f"[dim]Log: {service.log_path()}[/dim]")
         raise typer.Exit(0 if res.ok else 1)
     if service_status:
         res = service.status()
         console.print(f"[green]running[/green] {res.message}" if res.ok else f"[yellow]{res.message}[/yellow]")
-        log = service.log_path()
-        if log.exists():
+        if (log := service.log_path()).exists():
             console.print(f"[dim]{log}:[/dim]")
             console.print("\n".join(log.read_text().splitlines()[-8:]))
         return
     Watchdog(settings, dry_run=dry_run).run()
 
 
-@app.command("history")
+@app.command("history", help="Outages the watchdog has seen: how often, how long, what fixed them, what time of day.")
 def history_cmd(limit: Annotated[int, typer.Option("--limit", "-n", help="Recent outages to list")] = 15):
-    """Outages the watchdog has seen: how often, how long, what fixed them, what time of day."""
     incidents = history.load()
     if not incidents:
         console.print(f"No outages recorded yet ({history.incidents_path()}).")
@@ -332,35 +295,33 @@ def history_cmd(limit: Annotated[int, typer.Option("--limit", "-n", help="Recent
     )
     console.print("Causes:   " + ", ".join(f"{k} {v}" for k, v in s.by_verdict.most_common()))
     console.print("Fixed by: " + ", ".join(f"{k} {v}" for k, v in s.by_fix.most_common()))
-    if s.by_hour:
-        peak = max(s.by_hour.values())
-        console.print("\nOutages by hour of day:")
-        for hour in range(24):
-            n = s.by_hour.get(hour, 0)
-            if n:
-                console.print(f"  {hour:02d}:00 {'█' * max(1, round(20 * n / peak))} {n}")
+    peak = max(s.by_hour.values())
+    console.print("\nOutages by hour of day:")
+    for hour, n in sorted(s.by_hour.items()):
+        console.print(f"  {hour:02d}:00 {'█' * max(1, round(20 * n / peak))} {n}")
 
 
-@app.command()
+@app.command(help="Show which settings file is in use and what's configured (passwords hidden).")
 def config():
-    """Show which settings file is in use and what's configured (passwords hidden)."""
     console.print(f"Settings file: [bold]{ENV_FILE or 'none found'}[/bold]")
     if not ENV_FILE:
         console.print("Looked in: " + ", ".join(str(p) for p in env_candidates()))
-    t = Table(show_header=False)
-    t.add_column(style="dim")
-    t.add_column()
-    t.add_row("MODEM_URL", settings.modem_url)
-    t.add_row("MODEM_USER / PASSWORD", f"{settings.modem_user} / {'set' if settings.modem_password else '[red]missing[/red]'}")
-    t.add_row("ROUTER_URL", settings.router_url or "[dim]none (modem is the Wi-Fi)[/dim]")
-    if settings.router_configured:
-        t.add_row("ROUTER_USER / PASSWORD", f"{settings.router_user} / {'set' if settings.router_password else '[red]missing[/red]'}")
-    t.add_row("Home gateways", ", ".join(settings.home_gateways))
-    t.add_row("HOME_GATEWAY_MAC", settings.home_gateway_mac or "[yellow]not pinned[/yellow]")
-    t.add_row("ALLOWED_SSIDS", ", ".join(settings.allowed_ssids) or "[dim]any[/dim]")
-    t.add_row("Check every", f"{settings.check_interval}s, act after {settings.offline_checks_before_fix} failed checks")
-    t.add_row("Reboot cooldown", f"{settings.reboot_cooldown}s")
-    console.print(t)
+    s = settings
+    rows = {
+        "MODEM_URL": s.modem_url,
+        "MODEM_USER / PASSWORD": f"{s.modem_user} / {'set' if s.modem_password else '[red]missing[/red]'}",
+        "ROUTER_URL": s.router_url or "[dim]none (modem is the Wi-Fi)[/dim]",
+    }
+    if s.separate_router:
+        rows["ROUTER_USER / PASSWORD"] = f"{s.router_user} / {'set' if s.router_password else '[red]missing[/red]'}"
+    rows |= {
+        "Home gateways": ", ".join(s.home_gateways),
+        "HOME_GATEWAY_MAC": s.home_gateway_mac or "[yellow]not pinned[/yellow]",
+        "ALLOWED_SSIDS": ", ".join(s.allowed_ssids) or "[dim]any[/dim]",
+        "Check every": f"{s.check_interval}s, act after {s.offline_checks_before_fix} failed checks",
+        "Reboot cooldown": f"{s.reboot_cooldown}s",
+    }
+    console.print(kv_table("", rows))
 
 
 def main():
@@ -368,4 +329,7 @@ def main():
         app()
     except AuthError as e:
         console.print(f"[red]Login failed: {e}[/red]")
+        sys.exit(1)
+    except (ModemError, RouterError) as e:
+        console.print(f"[red]{e}[/red]")
         sys.exit(1)

@@ -1,52 +1,48 @@
 import socket
-from typing import Any
-import struct
 import threading
+import dns.message
+import dns.rcode
 import pytest
 from wifi_helper import net
-from wifi_helper.config import Settings, host_of, normalize_mac, parse_list
-from wifi_helper.modem import network_type_label
+from wifi_helper.config import Settings, host_of, normalize_mac
+from wifi_helper.modem import MonitoringStatus, network_type_label
+from wifi_helper.router import scram_proof
 
 
-@pytest.mark.parametrize(
-    "raw, expected",
-    [
-        ("192.168.3.1,192.168.8.1", ("192.168.3.1", "192.168.8.1")),
-        ('["192.168.3.1", "192.168.8.1"]', ("192.168.3.1", "192.168.8.1")),
-        ('"Home WiFi,Home WiFi 5G"', ("Home WiFi", "Home WiFi 5G")),
-        ("", ()),
-        (None, ()),
-    ],
-)
-def test_parse_list(raw, expected):
-    assert parse_list(raw) == expected
+def make_settings(**kw) -> Settings:
+    return Settings(_env_file=None, **kw)
+
+
+def test_lists_are_comma_separated():
+    s = make_settings(allowed_gateways="192.168.3.1, 192.168.8.1", allowed_ssids="Home WiFi,Home WiFi 5G,")
+    assert s.allowed_gateways == ("192.168.3.1", "192.168.8.1")
+    assert s.allowed_ssids == ("Home WiFi", "Home WiFi 5G")
+
+
+def test_settings_reject_unsafe_intervals():
+    with pytest.raises(ValueError):
+        make_settings(reboot_cooldown=10)
 
 
 def test_normalize_mac_pads_macos_arp_output():
     assert normalize_mac("2c:7:6:fc:b:15") == "2c:07:06:fc:0b:15"
     assert normalize_mac("2C-07-06-FC-0B-15") == "2c:07:06:fc:0b:15"
     assert normalize_mac("garbage") is None
+    assert make_settings(home_gateway_mac="2C:7:6:FC:B:15").home_gateway_mac == "2c:07:06:fc:0b:15"
 
 
 def test_host_of():
     assert host_of("http://192.168.8.1") == "192.168.8.1"
-    assert host_of("192.168.8.1:8080") == "192.168.8.1"
+    assert host_of("http://192.168.8.1:8080/") == "192.168.8.1"
     assert host_of("") == ""
 
 
-def make_settings(**kw) -> Settings:
-    base: dict[str, Any] = dict(
-        modem_url="http://192.168.8.1", modem_user="admin", modem_password="", router_url="", router_user="admin",
-        router_password="", allowed_gateways=(), allowed_ssids=(), home_gateway_mac=None, check_interval=15,
-        offline_checks_before_fix=2, reboot_cooldown=900,
-    )
-    base.update(kw)
-    return Settings(**base)
-
-
 def test_home_gateways_default_to_device_hosts():
-    s = make_settings(router_url="http://192.168.3.1")
+    s = make_settings(router_url="http://192.168.3.1/")
+    assert s.router_url == "http://192.168.3.1"
     assert s.home_gateways == ("192.168.3.1", "192.168.8.1")
+    assert s.separate_router
+    assert not make_settings(router_url="http://192.168.8.1").separate_router
 
 
 @pytest.fixture
@@ -67,10 +63,10 @@ def test_home_check_rejects_lookalike_gateway(fake_net):
 
 
 def test_home_check_ssid_is_exact_not_substring(fake_net):
-    s = make_settings(allowed_ssids=("Home",))
+    s = make_settings(allowed_ssids="Home")
     fake_net("192.168.8.1", None, "Home Office Guest")
     assert not net.check_home_network(s).is_home
-    fake_net("192.168.8.1", None, None)  # macOS hides SSIDs without location access
+    fake_net("192.168.8.1", None, None)
     assert net.check_home_network(s).is_home
 
 
@@ -86,8 +82,9 @@ def test_dns_probe_accepts_any_reply_and_rejects_silence():
 
     def answer_refused():
         data, addr = srv.recvfrom(512)
-        qid = struct.unpack(">H", data[:2])[0]
-        srv.sendto(struct.pack(">HHHHHH", qid, 0x8105, 1, 0, 0, 0), addr)  # REFUSED is still a reply
+        reply = dns.message.make_response(dns.message.from_wire(data))
+        reply.set_rcode(dns.rcode.REFUSED)
+        srv.sendto(reply.to_wire(), addr)
 
     t = threading.Thread(target=answer_refused)
     t.start()
@@ -97,6 +94,7 @@ def test_dns_probe_accepts_any_reply_and_rejects_silence():
     finally:
         t.join()
         srv.close()
+
 
 def test_vpn_interface_detection():
     assert net.is_vpn_interface("utun1")
@@ -110,3 +108,15 @@ def test_network_type_label_does_not_guess():
     assert network_type_label("9999") == "type 9999"
     assert network_type_label(None, "19") == "type 19"
 
+
+def test_monitoring_status_from_api():
+    m = MonitoringStatus.from_api({
+        "ConnectionStatus": "901", "SignalIcon": "4", "CurrentNetworkTypeEx": "101",
+        "PrimaryDns": "10.1.1.1", "SecondaryDns": None, "SimStatus": "1",
+    })
+    assert m.connected and m.signal_bars == 4 and m.network_type == "4G LTE"
+    assert m.carrier_dns == ["10.1.1.1"] and m.sim_ok
+
+
+def test_scram_proof_known_value():
+    assert scram_proof("pässword", "00ff10ab" * 8, 100, "a,b,b") == "0f8f6c3798b549840349a8782458ec41cfc06de5fc04a912d224546ca5df753f"

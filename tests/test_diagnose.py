@@ -24,10 +24,8 @@ def snap(**kw) -> Snapshot:
         (dict(home=AWAY), Verdict.NOT_HOME),
         (dict(http="ok"), Verdict.ONLINE),
         (dict(router_reachable=False, modem_reachable=False), Verdict.LAN_DOWN),
-        # Router's web page too busy to answer, but the modem answers through it: router is fine.
         (dict(router_reachable=False, modem_reachable=True, modem=modem(status="902", bars=3)), Verdict.MODEM_DISCONNECTED),
         (dict(modem=modem(status="900", bars=3)), Verdict.MODEM_CONNECTING),
-        # No signal: Huawei devices serve their own error page. That's not a captive portal.
         (dict(modem=None, bearer_ok=None, http="redirect"), Verdict.DEAD_BEARER),
         (dict(bearer_ok=False, http="redirect"), Verdict.DEAD_BEARER),
         (dict(modem_reachable=False), Verdict.LAN_DOWN),
@@ -35,7 +33,6 @@ def snap(**kw) -> Snapshot:
         (dict(modem=modem(sim=False)), Verdict.NO_SIGNAL),
         (dict(modem=modem(status="902", bars=0)), Verdict.NO_SIGNAL),
         (dict(modem=modem(status="902", bars=3)), Verdict.MODEM_DISCONNECTED),
-        # The case this tool exists for: "connected", full bars, nothing flows.
         (dict(modem=modem(bars=5), bearer_ok=False), Verdict.DEAD_BEARER),
         (dict(bearer_ok=True, vpn_iface="utun3"), Verdict.VPN_PROBLEM),
         (dict(bearer_ok=True, vpn_iface="en0"), Verdict.UPSTREAM_DOWN),
@@ -54,7 +51,7 @@ def choose(verdict, state=None, router=True, last_reboot=0.0, now=10_000.0, cool
     return choose_action(
         verdict,
         state or IncidentState(),
-        router_configured=router,
+        separate_router=router,
         last_reboot_at=last_reboot,
         reboot_cooldown=cooldown,
         now=now,
@@ -110,7 +107,6 @@ def test_long_outage_allows_ladder_again():
 
 
 def test_connecting_modem_is_left_alone_after_power_up():
-    # Tonight's case: user power-cycled, modem reported 900 and the watchdog piled on.
     assert choose(Verdict.MODEM_CONNECTING, age=20) == Action.NONE
     assert choose(Verdict.MODEM_CONNECTING, age=170) == Action.NONE
     assert choose(Verdict.MODEM_CONNECTING, age=200) == Action.CYCLE_DATA

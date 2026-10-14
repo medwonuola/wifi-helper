@@ -107,7 +107,7 @@ Pin `HOME_GATEWAY_MAC`. Huawei routers all default to the same addresses, so wit
 | `wifi fix [--dry-run]` | Diagnose and apply the smallest working fix. |
 | `wifi status` | Carrier, 4G/5G, signal, speed, data used, SMS count, router clients. |
 | `wifi cycle` | Restart mobile data. |
-| `wifi reboot [--modem] [--router] [--all]` | Reboot devices. |
+| `wifi reboot [--router] [--all]` | Reboot the modem (default), the router, or both. |
 | `wifi sms list` / `wifi sms send NUMBER TEXT` | Read data-bundle alerts, send SMS. |
 | `wifi ussd CODE` | Run a USSD code (e.g. your carrier's data balance code). |
 | `wifi daemon [--dry-run]` | Watch and heal in the foreground. |
@@ -132,7 +132,7 @@ Safety rules:
 | Huawei 5G CPE (HiLink, SCRAM login) on Airtel Nigeria | Tested (author's setup) |
 | Huawei WiFi AX3S as the router in front of it | Tested |
 | Other Huawei HiLink CPEs, routers and dongles (B-series, E-series, 5G CPE Pro/Win) | Should work; same API |
-| Older HiLink firmware with SHA-256 login | Implemented, untested on real hardware |
+| Older HiLink firmware (B310, B525, E3372, ...) | Should work; login handled by [huawei-lte-api](https://github.com/Salamek/huawei-lte-api) |
 | ZTE, MediaTek and other non-Huawei routers | `doctor` checks still work (minus the modem API); no automatic fixes |
 
 If you try it on another device, please open an issue with the output of `wifi doctor` and your model.
@@ -155,7 +155,7 @@ uv sync
 uv run pytest
 ```
 
-The decision logic (`classify` and `choose_action` in `src/wifi_helper/diagnose.py`) is pure and fully unit-tested; probes live in `net.py`, device APIs in `modem.py` and `router.py`.
+The decision logic (`classify` and `choose_action` in `src/wifi_helper/diagnose.py`) is pure and fully unit-tested. Probes live in `net.py`; the modem is driven through [huawei-lte-api](https://github.com/Salamek/huawei-lte-api) in `modem.py`; the AX3-style router API is in `router.py`.
 
 ## License
 

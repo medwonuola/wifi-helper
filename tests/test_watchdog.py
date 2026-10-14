@@ -3,8 +3,6 @@ from wifi_helper.watchdog import WAKE_GRACE, SleepDetector
 
 
 class Clocks:
-    """Wall clock and awake clock. Sleeping advances only the wall clock, as on macOS and Linux."""
-
     def __init__(self):
         self.wall, self.awake = 1_000_000.0, 50.0
 
@@ -26,7 +24,7 @@ def test_normal_running_and_long_checks_are_not_sleep():
     for _ in range(10):
         c.run(15)
         assert not d.slept()
-    c.run(400)  # a slow heal: reboot and recovery wait
+    c.run(400)
     assert not d.slept()
     assert not d.settling()
 
@@ -42,13 +40,12 @@ def test_dark_wake_is_detected_and_settles_after_grace():
     assert d.slept()
     assert d.slept_at == before
     assert d.settling()
-    assert not d.slept()  # reported once
+    assert not d.slept()
     c.run(WAKE_GRACE + 1)
     assert not d.settling()
 
 
 def test_grace_counts_awake_time_across_repeated_dark_wakes():
-    # Overnight: a few seconds awake every ~17 minutes. None of that should count as an outage.
     c = Clocks()
     d = detector(c)
     for _ in range(20):

@@ -1,22 +1,17 @@
-"""Watch the connection and heal it with the smallest fix that works."""
-
 from dataclasses import asdict
 import time
 from typing import Callable
 from rich.console import Console
-from . import history, net
+from . import history, modem, net
 from .config import Settings
 from .diagnose import EXPLANATIONS, Action, IncidentState, Snapshot, Verdict, choose_action, classify, full_check, quick_check
-from .modem import AuthError, ModemClient
+from .modem import AuthError
 from .router import RouterClient
 
 console = Console(emoji=False)
 
-# How long to wait for the internet to come back after each action.
 RECOVERY_WAIT = {Action.CYCLE_DATA: 45, Action.REBOOT_MODEM: 180, Action.REBOOT_ROUTER: 150}
-# Wall-clock time running this far ahead of awake time means the computer slept.
 SLEEP_GAP = 30.0
-# After a wake, Wi-Fi and VPNs need time to reconnect. Failures in this window say nothing about the modem.
 WAKE_GRACE = 90.0
 
 
@@ -25,8 +20,6 @@ def log(msg: str) -> None:
 
 
 class AuthBackoff:
-    """Stop retrying logins after a failure. Repeated bad logins lock HiLink devices."""
-
     def __init__(self, base: float = 300.0, cap: float = 3600.0):
         self.base, self.cap = base, cap
         self.failures = 0
@@ -46,21 +39,15 @@ class AuthBackoff:
 
 
 class Slept(Exception):
-    """The computer slept, so whatever we were measuring is stale."""
+    pass
 
 
 class SleepDetector:
-    """Notice sleep and wake. time.monotonic() stops while the computer sleeps; the wall clock doesn't.
-
-    A sleeping laptop wakes briefly every ~15 minutes for maintenance ("dark wake").
-    Its VPN and Wi-Fi are still reconnecting then, which looks exactly like an outage.
-    """
-
     def __init__(self, wall: Callable[[], float] = time.time, awake: Callable[[], float] = time.monotonic):
         self.wall, self.awake = wall, awake
         self._wall, self._awake = wall(), awake()
-        self.slept_at: float | None = None  # wall time of the last check before the sleep
-        self.woke_at: float | None = None  # awake time of the first check after it
+        self.slept_at: float | None = None
+        self.woke_at: float | None = None
 
     def slept(self) -> bool:
         wall, awake = self.wall(), self.awake()
@@ -93,35 +80,36 @@ class Watchdog:
         self.sleep = SleepDetector()
 
     def perform(self, action: Action) -> bool:
-        """Run one action. Returns True if the device accepted it."""
         now = time.time()
         if self.dry_run:
             log(f"[cyan]dry run:[/cyan] would {action.value}")
             return False
-        if action in (Action.CYCLE_DATA, Action.REBOOT_MODEM) and not self.auth.allowed(now):
+        touches_modem = action != Action.REBOOT_ROUTER
+        if touches_modem and not self.auth.allowed(now):
             log(f"[yellow]Skipping {action.value}: modem login paused after failure ({self.auth.last_error}).[/yellow]")
             return False
         try:
-            if action == Action.CYCLE_DATA:
-                with ModemClient() as m:
-                    ok = m.cycle_data()
-            elif action == Action.REBOOT_MODEM:
-                with ModemClient() as m:
-                    ok = m.reboot()
-            elif action == Action.REBOOT_ROUTER:
-                with RouterClient() as r:
-                    ok = r.reboot()
-            else:
-                return False
+            match action:
+                case Action.CYCLE_DATA:
+                    with modem.session(self.settings) as c:
+                        ok = modem.cycle_data(c)
+                case Action.REBOOT_MODEM:
+                    with modem.session(self.settings) as c:
+                        ok = modem.reboot(c)
+                case Action.REBOOT_ROUTER:
+                    with RouterClient(self.settings) as r:
+                        ok = r.reboot()
+                case _:
+                    return False
         except AuthError as e:
-            if action != Action.REBOOT_ROUTER:
+            if touches_modem:
                 self.auth.failed(e, now)
             log(f"[red]{action.value} failed: {e}[/red]")
             return False
         except Exception as e:
             log(f"[red]{action.value} failed: {e}[/red]")
             return False
-        if action != Action.REBOOT_ROUTER:
+        if touches_modem:
             self.auth.succeeded()
         if action in (Action.REBOOT_MODEM, Action.REBOOT_ROUTER):
             self.last_reboot_at = now
@@ -135,7 +123,6 @@ class Watchdog:
         on_step: Callable[[Snapshot, Verdict], None] | None = None,
         started: float | None = None,
     ) -> bool:
-        """Diagnose and fix until online, out of options, or we leave the home network."""
         started = time.monotonic() if started is None else started
         verdict = classify(snap)
         if snap.modem and incident.modem is None:
@@ -156,7 +143,7 @@ class Watchdog:
             action = choose_action(
                 verdict,
                 state,
-                router_configured=self.settings.router_configured,
+                separate_router=self.settings.separate_router,
                 last_reboot_at=self.last_reboot_at,
                 reboot_cooldown=self.settings.reboot_cooldown,
                 now=time.time(),
@@ -179,7 +166,6 @@ class Watchdog:
             verdict = classify(snap)
 
     def self_check(self) -> bool:
-        """Log what this process can see. Background services can be denied LAN access by the OS."""
         home = net.check_home_network(self.settings)
         if not home.is_home:
             log(f"Not on home network ({home.reason}); idle until it's back.")
@@ -197,7 +183,7 @@ class Watchdog:
         log(f"[bold green]wifi-helper watchdog started[/bold green] (every {s.check_interval}s, home gateways: {', '.join(s.home_gateways)})")
         was_home = self.self_check()
         offline_streak = 0
-        first_fail: tuple[float, str] | None = None  # when the current outage really began
+        first_fail: tuple[float, str] | None = None
         outage: Outage | None = None
 
         while True:
@@ -237,7 +223,7 @@ class Watchdog:
                     outage = Outage(verdict, *first_fail)
                     log(f"[bold red]Offline: {verdict.value}[/bold red] {EXPLANATIONS[verdict]}")
                 elif outage.state.exhausted_for(s.reboot_cooldown):
-                    outage.state = IncidentState()  # long outage: allow the ladder again
+                    outage.state = IncidentState()
                 if self.heal(snap, outage.incident, outage.state, started=outage.t0):
                     outage.close(outage.incident.recovered_by)
                     offline_streak, outage, first_fail = 0, None, None
