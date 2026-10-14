@@ -24,8 +24,8 @@ class Incident:
     modem: dict | None = None
 
 
-def now_iso() -> str:
-    return datetime.now().astimezone().isoformat(timespec="seconds")
+def now_iso(ts: float | None = None) -> str:
+    return (datetime.fromtimestamp(ts) if ts is not None else datetime.now()).astimezone().isoformat(timespec="seconds")
 
 
 def append(incident: Incident) -> None:

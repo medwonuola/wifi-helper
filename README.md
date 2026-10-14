@@ -116,7 +116,7 @@ Pin `HOME_GATEWAY_MAC`. Huawei routers all default to the same addresses, so wit
 
 ### The watchdog
 
-Every `CHECK_INTERVAL` seconds it makes one cheap web check. Only after `OFFLINE_CHECKS_BEFORE_FIX` failures in a row does it run the full diagnosis and act, so a single dropped packet never triggers a reboot. Each outage is logged to `incidents.jsonl` (`~/Library/Logs/wifi-helper/` on macOS, `~/.local/state/wifi-helper/` on Linux). `wifi history` turns that into evidence: how often it dies, for how long, and at what time of day. That's useful when you call your carrier.
+Every `CHECK_INTERVAL` seconds it makes one cheap web check. Only after `OFFLINE_CHECKS_BEFORE_FIX` failures in a row does it run the full diagnosis and act, so a single dropped packet never triggers a reboot. It also notices when the computer sleeps: for 90 seconds after any wake, including the brief maintenance wakes a sleeping laptop makes all night, it doesn't judge the network, because Wi-Fi and VPNs are still reconnecting. Each outage is logged to `incidents.jsonl` (`~/Library/Logs/wifi-helper/` on macOS, `~/.local/state/wifi-helper/` on Linux). `wifi history` turns that into evidence: how often it dies, for how long, and at what time of day. That's useful when you call your carrier.
 
 Safety rules:
 

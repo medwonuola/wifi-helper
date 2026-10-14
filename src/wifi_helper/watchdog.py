@@ -14,6 +14,10 @@ console = Console(emoji=False)
 
 # How long to wait for the internet to come back after each action.
 RECOVERY_WAIT = {Action.CYCLE_DATA: 45, Action.REBOOT_MODEM: 180, Action.REBOOT_ROUTER: 150}
+# Wall-clock time running this far ahead of awake time means the computer slept.
+SLEEP_GAP = 30.0
+# After a wake, Wi-Fi and VPNs need time to reconnect. Failures in this window say nothing about the modem.
+WAKE_GRACE = 90.0
 
 
 def log(msg: str) -> None:
@@ -41,6 +45,36 @@ class AuthBackoff:
         self.failures, self.until, self.last_error = 0, 0.0, ""
 
 
+class Slept(Exception):
+    """The computer slept, so whatever we were measuring is stale."""
+
+
+class SleepDetector:
+    """Notice sleep and wake. time.monotonic() stops while the computer sleeps; the wall clock doesn't.
+
+    A sleeping laptop wakes briefly every ~15 minutes for maintenance ("dark wake").
+    Its VPN and Wi-Fi are still reconnecting then, which looks exactly like an outage.
+    """
+
+    def __init__(self, wall: Callable[[], float] = time.time, awake: Callable[[], float] = time.monotonic):
+        self.wall, self.awake = wall, awake
+        self._wall, self._awake = wall(), awake()
+        self.slept_at: float | None = None  # wall time of the last check before the sleep
+        self.woke_at: float | None = None  # awake time of the first check after it
+
+    def slept(self) -> bool:
+        wall, awake = self.wall(), self.awake()
+        gap = (wall - self._wall) - (awake - self._awake)
+        before, self._wall, self._awake = self._wall, wall, awake
+        if gap > SLEEP_GAP:
+            self.slept_at, self.woke_at = before, awake
+            return True
+        return False
+
+    def settling(self) -> bool:
+        return self.woke_at is not None and self.awake() - self.woke_at < WAKE_GRACE
+
+
 def wait_for_recovery(settings: Settings, seconds: int, poll: float = 3.0) -> bool:
     deadline = time.monotonic() + seconds
     while time.monotonic() < deadline:
@@ -56,6 +90,7 @@ class Watchdog:
         self.dry_run = dry_run
         self.auth = AuthBackoff()
         self.last_reboot_at = 0.0
+        self.sleep = SleepDetector()
 
     def perform(self, action: Action) -> bool:
         """Run one action. Returns True if the device accepted it."""
@@ -106,6 +141,8 @@ class Watchdog:
         if snap.modem and incident.modem is None:
             incident.modem = asdict(snap.modem)
         while True:
+            if self.sleep.slept():
+                raise Slept
             if not incident.verdicts or incident.verdicts[-1] != verdict.value:
                 if incident.verdicts:
                     log(f"Now: {verdict.value}")
@@ -131,7 +168,10 @@ class Watchdog:
             log(f"[yellow]{verdict.value}: trying {action.value}[/yellow]")
             state.record(action)
             incident.actions.append(action.value)
-            if self.perform(action) and wait_for_recovery(self.settings, RECOVERY_WAIT[action]):
+            recovered = self.perform(action) and wait_for_recovery(self.settings, RECOVERY_WAIT[action])
+            if self.sleep.slept():
+                raise Slept
+            if recovered:
                 incident.recovered_by = action.value
                 log(f"[green]Back online after {action.value}.[/green]")
                 return True
@@ -162,6 +202,8 @@ class Watchdog:
 
         while True:
             try:
+                if self.sleep.slept():
+                    raise Slept
                 snap = quick_check(s)
                 if snap.home.is_home != was_home:
                     was_home = snap.home.is_home
@@ -178,6 +220,9 @@ class Watchdog:
                     time.sleep(s.check_interval)
                     continue
 
+                if self.sleep.settling():
+                    time.sleep(min(s.check_interval, 5))
+                    continue
                 offline_streak += 1
                 first_fail = first_fail or (time.monotonic(), history.now_iso())
                 if offline_streak < s.offline_checks_before_fix:
@@ -196,6 +241,11 @@ class Watchdog:
                 if self.heal(snap, outage.incident, outage.state, started=outage.t0):
                     outage.close(outage.incident.recovered_by)
                     offline_streak, outage, first_fail = 0, None, None
+            except Slept:
+                if outage:
+                    outage.close("computer slept", ended=self.sleep.slept_at)
+                offline_streak, outage, first_fail = 0, None, None
+                log("Computer was asleep; letting Wi-Fi and VPN reconnect before judging the network.")
             except KeyboardInterrupt:
                 if outage:
                     outage.close("watchdog stopped")
@@ -211,8 +261,8 @@ class Outage:
         self.incident = history.Incident(started=started or history.now_iso(), verdict=verdict.value)
         self.state = IncidentState()
 
-    def close(self, recovered_by: str | None) -> None:
-        self.incident.ended = history.now_iso()
+    def close(self, recovered_by: str | None, ended: float | None = None) -> None:
+        self.incident.ended = history.now_iso(ended)
         self.incident.duration_s = round(time.monotonic() - self.t0, 1)
         self.incident.recovered_by = recovered_by or self.incident.recovered_by or "by itself"
         history.append(self.incident)

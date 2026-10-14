@@ -9,7 +9,7 @@ from .config import ENV_FILE, env_candidates, settings
 from .diagnose import EXPLANATIONS, Action, IncidentState, Snapshot, Verdict, choose_action, classify, full_check
 from .modem import AuthError, ModemClient, ModemError
 from .router import RouterClient
-from .watchdog import Outage, Watchdog
+from .watchdog import Outage, Slept, Watchdog
 
 app = typer.Typer(
     help="Offline helper for Huawei HiLink 4G/5G home internet (Airtel, MTN, Glo, ...): diagnose, fix, watch.",
@@ -111,7 +111,10 @@ def fix(dry_run: Annotated[bool, typer.Option("--dry-run", help="Show what would
             seen.append(v)
             console.print(f"[bold]{v.value}[/bold]: {EXPLANATIONS[v]}")
 
-    recovered = wd.heal(snap, outage.incident, outage.state, on_step, started=outage.t0)
+    try:
+        recovered = wd.heal(snap, outage.incident, outage.state, on_step, started=outage.t0)
+    except Slept:
+        fail("The computer slept during the fix. Run `wifi fix` again.")
     if not dry_run:
         outage.close(outage.incident.recovered_by if recovered else "not recovered")
     if recovered:
