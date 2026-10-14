@@ -51,6 +51,29 @@ class AuthError(ModemError):
     pass
 
 
+class LoginBackoff:
+    def __init__(self, base: float = 300.0, cap: float = 3600.0):
+        self.base, self.cap = base, cap
+        self.failures = 0
+        self.until = 0.0
+        self.last_error = ""
+
+    def check(self, now: float) -> None:
+        if now < self.until:
+            raise AuthError(f"login paused until {time.strftime('%H:%M', time.localtime(self.until))} after: {self.last_error}")
+
+    def failed(self, err: str, now: float) -> None:
+        self.failures += 1
+        self.last_error = err
+        self.until = now + min(self.cap, self.base * 2 ** (self.failures - 1))
+
+    def succeeded(self) -> None:
+        self.failures, self.until, self.last_error = 0, 0.0, ""
+
+
+login_backoff = LoginBackoff()
+
+
 def network_type_label(ex: str | None, legacy: str | None = None) -> str:
     if ex:
         return NETWORK_TYPE_EX.get(ex, f"type {ex}")
@@ -107,11 +130,16 @@ class ModemStatus:
 def session(s: Settings, login: bool = True, timeout: float = 15.0) -> Iterator[Client]:
     if login and not s.modem_password:
         raise AuthError("MODEM_PASSWORD is not set")
+    if login:
+        login_backoff.check(time.time())
     user, password = (s.modem_user, s.modem_password) if login else (None, None)
     try:
         with Connection(s.modem_url, user, password, timeout=timeout) as conn:
+            if login:
+                login_backoff.succeeded()
             yield Client(conn)
     except LOGIN_ERRORS as e:
+        login_backoff.failed(str(e), time.time())
         raise AuthError(str(e)) from e
     except (ResponseErrorException, requests.RequestException) as e:
         raise ModemError(str(e) or e.__class__.__name__) from e

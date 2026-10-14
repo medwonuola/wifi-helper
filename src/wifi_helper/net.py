@@ -150,7 +150,7 @@ def check_home_network(s: Settings) -> HomeCheck:
     if mac is None:
         tcp_reachable(gw, 80, timeout=0.5)
         mac = get_gateway_mac(gw)
-    if s.home_gateway_mac and mac != s.home_gateway_mac:
+    if s.home_gateway_mac and mac not in s.home_gateway_mac:
         return HomeCheck(False, f"gateway MAC {mac} does not match HOME_GATEWAY_MAC", gw, mac, ssid)
     if s.allowed_ssids and ssid and ssid.casefold() not in {x.casefold() for x in s.allowed_ssids}:
         return HomeCheck(False, f"Wi-Fi '{ssid}' is not in ALLOWED_SSIDS", gw, mac, ssid)

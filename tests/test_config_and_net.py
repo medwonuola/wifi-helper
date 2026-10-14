@@ -4,8 +4,8 @@ import dns.message
 import dns.rcode
 import pytest
 from wifi_helper import net
-from wifi_helper.config import Settings, host_of, normalize_mac
-from wifi_helper.modem import MonitoringStatus, network_type_label
+from wifi_helper.config import Settings, host_of, is_ours, normalize_mac
+from wifi_helper.modem import AuthError, LoginBackoff, MonitoringStatus, network_type_label
 from wifi_helper.router import scram_proof
 
 
@@ -28,7 +28,9 @@ def test_normalize_mac_pads_macos_arp_output():
     assert normalize_mac("2c:7:6:fc:b:15") == "2c:07:06:fc:0b:15"
     assert normalize_mac("2C-07-06-FC-0B-15") == "2c:07:06:fc:0b:15"
     assert normalize_mac("garbage") is None
-    assert make_settings(home_gateway_mac="2C:7:6:FC:B:15").home_gateway_mac == "2c:07:06:fc:0b:15"
+    assert make_settings(home_gateway_mac="2C:7:6:FC:B:15").home_gateway_mac == ("2c:07:06:fc:0b:15",)
+    with pytest.raises(ValueError):
+        make_settings(home_gateway_mac="aa:bb:cc:dd:ee:ff,garbage")
 
 
 def test_host_of():
@@ -60,6 +62,21 @@ def test_home_check_rejects_lookalike_gateway(fake_net):
     assert not net.check_home_network(s).is_home
     fake_net("192.168.8.1", "aa:bb:cc:dd:ee:ff")
     assert net.check_home_network(s).is_home
+
+
+def test_home_check_accepts_any_pinned_mac(fake_net):
+    s = make_settings(home_gateway_mac="aa:bb:cc:dd:ee:ff, 11:22:33:44:55:66")
+    fake_net("192.168.8.1", "11:22:33:44:55:66")
+    assert net.check_home_network(s).is_home
+
+
+def test_only_env_files_with_modem_settings_are_used(tmp_path):
+    other, ours = tmp_path / "other.env", tmp_path / ".env"
+    other.write_text("API_TOKEN=x\n")
+    ours.write_text("# comment\nMODEM_URL=http://192.168.8.1\n")
+    assert not is_ours(other)
+    assert is_ours(ours)
+    assert not is_ours(tmp_path / "missing")
 
 
 def test_home_check_ssid_is_exact_not_substring(fake_net):
@@ -120,3 +137,19 @@ def test_monitoring_status_from_api():
 
 def test_scram_proof_known_value():
     assert scram_proof("pässword", "00ff10ab" * 8, 100, "a,b,b") == "0f8f6c3798b549840349a8782458ec41cfc06de5fc04a912d224546ca5df753f"
+
+
+def test_login_backoff_doubles_and_resets():
+    b = LoginBackoff(base=300, cap=3600)
+    b.check(0)
+    b.failed("bad password", 0)
+    with pytest.raises(AuthError):
+        b.check(299)
+    b.check(300)
+    b.failed("bad password", 300)
+    assert b.until == 900
+    for _ in range(10):
+        b.failed("bad password", 1000)
+    assert b.until == 4600
+    b.succeeded()
+    b.check(1000)

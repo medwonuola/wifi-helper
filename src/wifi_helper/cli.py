@@ -139,6 +139,8 @@ def fix(dry_run: Annotated[bool, typer.Option("--dry-run", help="Show what would
         console.print("[bold green]Internet is back.[/bold green]")
     elif seen and seen[-1] == Verdict.MODEM_CONNECTING:
         fail("The modem is still connecting. Give it a minute or two, then run `wifi fix` again if it's still down.")
+    elif seen and seen[-1] == Verdict.MODEM_UNREACHABLE:
+        fail("The modem isn't answering; it is usually rebooting. Wait 5 minutes, then try `wifi reboot --router` if it's still down.")
     else:
         fail("Out of safe automatic fixes. See the explanation above.")
 
@@ -192,14 +194,15 @@ def reboot(
     router: Annotated[bool, typer.Option("--router", "-r", help="Reboot the Wi-Fi router instead of the modem")] = False,
     all_devs: Annotated[bool, typer.Option("--all", "-a", help="Reboot both")] = False,
 ):
+    if (all_devs or router) and not settings.separate_router:
+        fail("ROUTER_URL is not set.")
+    require_home()
     if all_devs or not router:
-        with modem_session() as c:
+        with modem.session(settings) as c:
             if not modem.reboot(c):
                 fail("Modem refused the reboot.")
         console.print("[green]Modem is rebooting.[/green]")
     if all_devs or router:
-        if not settings.separate_router:
-            fail("ROUTER_URL is not set.")
         with RouterClient(settings) as r:
             if not r.reboot():
                 fail("Router refused the reboot.")
@@ -317,7 +320,7 @@ def config():
         rows["ROUTER_USER / PASSWORD"] = f"{s.router_user} / {'set' if s.router_password else '[red]missing[/red]'}"
     rows |= {
         "Home gateways": ", ".join(s.home_gateways),
-        "HOME_GATEWAY_MAC": s.home_gateway_mac or "[yellow]not pinned[/yellow]",
+        "HOME_GATEWAY_MAC": ", ".join(s.home_gateway_mac) or "[yellow]not pinned[/yellow]",
         "ALLOWED_SSIDS": ", ".join(s.allowed_ssids) or "[dim]any[/dim]",
         "Check every": f"{s.check_interval}s, act after {s.offline_checks_before_fix} failed checks",
         "Reboot cooldown": f"{s.reboot_cooldown}s",

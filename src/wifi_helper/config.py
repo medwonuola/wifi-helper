@@ -1,4 +1,5 @@
 import os
+import re
 import sys
 from pathlib import Path
 from typing import Annotated
@@ -24,7 +25,11 @@ def env_candidates() -> list[Path]:
     return ([Path(explicit)] if explicit else []) + [Path.cwd() / ".env", config_dir() / "env"]
 
 
-ENV_FILE = next((p for p in env_candidates() if p.is_file()), None)
+def is_ours(path: Path) -> bool:
+    return path.is_file() and (path.name == "env" or bool(re.search(r"^\s*MODEM_", path.read_text(), re.M)))
+
+
+ENV_FILE = next((p for p in env_candidates() if is_ours(p)), None)
 
 
 def normalize_mac(mac: str | None) -> str | None:
@@ -53,20 +58,23 @@ class Settings(BaseSettings):
     router_password: str = ""
     allowed_gateways: CommaList = ()
     allowed_ssids: CommaList = ()
-    home_gateway_mac: str | None = None
+    home_gateway_mac: CommaList = ()
     check_interval: Annotated[int, Field(ge=5)] = 15
     offline_checks_before_fix: Annotated[int, Field(ge=1)] = 2
     reboot_cooldown: Annotated[int, Field(ge=60)] = 900
 
-    @field_validator("allowed_gateways", "allowed_ssids", mode="before")
+    @field_validator("allowed_gateways", "allowed_ssids", "home_gateway_mac", mode="before")
     @classmethod
     def _split(cls, v: object) -> object:
         return tuple(x.strip() for x in v.split(",") if x.strip()) if isinstance(v, str) else v
 
     @field_validator("home_gateway_mac")
     @classmethod
-    def _mac(cls, v: str | None) -> str | None:
-        return normalize_mac(v)
+    def _macs(cls, v: tuple[str, ...]) -> tuple[str, ...]:
+        macs = tuple(normalize_mac(m) for m in v)
+        if None in macs:
+            raise ValueError("HOME_GATEWAY_MAC must be MAC addresses like aa:bb:cc:dd:ee:ff")
+        return macs
 
     @field_validator("modem_url", "router_url")
     @classmethod

@@ -90,14 +90,14 @@ uv run wifi --help
 
 ## Configure
 
-Copy `.env.example` to `.env` (next to where you run it) or to `~/.config/wifi-helper/env`, then fill in your modem's address and admin password (the one for its web page). Then:
+Copy `.env.example` to `.env` (next to where you run it) or to `~/.config/wifi-helper/env`, then fill in your modem's address and admin password (the one for its web page). A `.env` without any `MODEM_` setting is ignored, so running `wifi` inside another project never picks up that project's file. Then:
 
 ```bash
 wifi config   # which settings file is loaded, what's missing (passwords never shown)
 wifi doctor   # full path check; also prints your gateway MAC to pin in .env
 ```
 
-Pin `HOME_GATEWAY_MAC`. Huawei routers all default to the same addresses, so without it, a friend's network that uses the same gateway IP would look like home.
+Pin `HOME_GATEWAY_MAC`. Huawei routers all default to the same addresses, so without it, a friend's network that uses the same gateway IP would look like home. If you sometimes join the modem's own Wi-Fi as well as the router's, list both MACs, comma-separated.
 
 ## Commands
 

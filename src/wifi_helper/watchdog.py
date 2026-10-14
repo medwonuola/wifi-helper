@@ -5,7 +5,6 @@ from rich.console import Console
 from . import history, modem, net
 from .config import Settings
 from .diagnose import EXPLANATIONS, Action, IncidentState, Snapshot, Verdict, choose_action, classify, full_check, quick_check
-from .modem import AuthError
 from .router import RouterClient
 
 console = Console(emoji=False)
@@ -17,25 +16,6 @@ WAKE_GRACE = 90.0
 
 def log(msg: str) -> None:
     console.print(f"[dim]{time.strftime('%H:%M:%S')}[/dim] {msg}")
-
-
-class AuthBackoff:
-    def __init__(self, base: float = 300.0, cap: float = 3600.0):
-        self.base, self.cap = base, cap
-        self.failures = 0
-        self.until = 0.0
-        self.last_error = ""
-
-    def allowed(self, now: float) -> bool:
-        return now >= self.until
-
-    def failed(self, err: AuthError, now: float) -> None:
-        self.failures += 1
-        self.last_error = str(err)
-        self.until = now + min(self.cap, self.base * 2 ** (self.failures - 1))
-
-    def succeeded(self) -> None:
-        self.failures, self.until, self.last_error = 0, 0.0, ""
 
 
 class Slept(Exception):
@@ -75,7 +55,6 @@ class Watchdog:
     def __init__(self, settings: Settings, dry_run: bool = False):
         self.settings = settings
         self.dry_run = dry_run
-        self.auth = AuthBackoff()
         self.last_reboot_at = 0.0
         self.sleep = SleepDetector()
 
@@ -83,10 +62,6 @@ class Watchdog:
         now = time.time()
         if self.dry_run:
             log(f"[cyan]dry run:[/cyan] would {action.value}")
-            return False
-        touches_modem = action != Action.REBOOT_ROUTER
-        if touches_modem and not self.auth.allowed(now):
-            log(f"[yellow]Skipping {action.value}: modem login paused after failure ({self.auth.last_error}).[/yellow]")
             return False
         try:
             match action:
@@ -101,16 +76,9 @@ class Watchdog:
                         ok = r.reboot()
                 case _:
                     return False
-        except AuthError as e:
-            if touches_modem:
-                self.auth.failed(e, now)
-            log(f"[red]{action.value} failed: {e}[/red]")
-            return False
         except Exception as e:
             log(f"[red]{action.value} failed: {e}[/red]")
             return False
-        if touches_modem:
-            self.auth.succeeded()
         if action in (Action.REBOOT_MODEM, Action.REBOOT_ROUTER):
             self.last_reboot_at = now
         return ok
@@ -218,6 +186,7 @@ class Watchdog:
                 snap = full_check(s, snap)
                 verdict = classify(snap)
                 if verdict in (Verdict.ONLINE, Verdict.NOT_HOME):
+                    time.sleep(min(s.check_interval, 5))
                     continue
                 if outage is None:
                     outage = Outage(verdict, *first_fail)
