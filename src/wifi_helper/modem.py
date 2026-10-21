@@ -1,5 +1,5 @@
 from collections.abc import Iterator
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 import time
 from huawei_lte_api.Client import Client
@@ -41,6 +41,9 @@ LOGIN_ERRORS = (
 )
 USSD_PENDING = 111019
 SMS_PAGE_MAX = 50
+DATA_OFF_SECONDS = 2.0
+DATA_ON_TRIES = 4
+DATA_ON_PAUSE = 3.0
 
 
 class ModemError(Exception):
@@ -134,10 +137,14 @@ def session(s: Settings, login: bool = True, timeout: float = 15.0) -> Iterator[
         login_backoff.check(time.time())
     user, password = (s.modem_user, s.modem_password) if login else (None, None)
     try:
-        with Connection(s.modem_url, user, password, timeout=timeout) as conn:
-            if login:
-                login_backoff.succeeded()
+        conn = Connection(s.modem_url, user, password, timeout=timeout)
+        if login:
+            login_backoff.succeeded()
+        try:
             yield Client(conn)
+        finally:
+            with suppress(ResponseErrorException, requests.RequestException):
+                conn.close()
     except LOGIN_ERRORS as e:
         login_backoff.failed(str(e), time.time())
         raise AuthError(str(e)) from e
@@ -200,10 +207,39 @@ def ussd(c: Client, code: str, timeout: float) -> str:
     return "USSD timed out waiting for the network."
 
 
-def cycle_data(c: Client) -> bool:
-    c.dial_up.set_mobile_dataswitch(0)
-    time.sleep(2.0)
-    return c.dial_up.set_mobile_dataswitch(1) == "OK"
+def cycle_data(s: Settings) -> bool:
+    off_sent = False
+    try:
+        with session(s) as c:
+            off_sent = True
+            c.dial_up.set_mobile_dataswitch(0)
+            time.sleep(DATA_OFF_SECONDS)
+            c.dial_up.set_mobile_dataswitch(1)
+    except ModemError:
+        if not off_sent:
+            raise
+    return ensure_data_on(s)
+
+
+def ensure_data_on(s: Settings, tries: int = DATA_ON_TRIES, pause: float = DATA_ON_PAUSE) -> bool:
+    last: ModemError | None = None
+    for attempt in range(tries):
+        if attempt:
+            time.sleep(pause)
+        try:
+            with session(s) as c:
+                if data_switch_on(c):
+                    return True
+                c.dial_up.set_mobile_dataswitch(1)
+                if data_switch_on(c):
+                    return True
+        except ModemError as e:
+            last = e
+    raise ModemError(f"mobile data may still be off after {tries} tries: {last or 'switch stayed off'}")
+
+
+def data_switch_on(c: Client) -> bool:
+    return c.dial_up.mobile_dataswitch().get("dataswitch") == "1"
 
 
 def reboot(c: Client) -> bool:

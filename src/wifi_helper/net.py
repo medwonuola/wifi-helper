@@ -1,6 +1,7 @@
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout, as_completed
 from dataclasses import dataclass
 import re
+import shutil
 import socket
 import subprocess
 import sys
@@ -17,8 +18,11 @@ DNS_PROBE_NAME = "connectivitycheck.gstatic.com"
 
 
 def _run(cmd: list[str], stdin: str | None = None) -> str:
+    exe = shutil.which(cmd[0])
+    if exe is None:
+        return ""
     try:
-        return subprocess.run(cmd, input=stdin, capture_output=True, text=True, timeout=2).stdout
+        return subprocess.run([exe, *cmd[1:]], input=stdin, capture_output=True, text=True, timeout=2, close_fds=False).stdout
     except (OSError, subprocess.SubprocessError):
         return ""
 

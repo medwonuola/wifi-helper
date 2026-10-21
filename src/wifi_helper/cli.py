@@ -183,9 +183,8 @@ def status():
 
 @app.command(help="Turn mobile data off and on (fast fix, ~10-30s, Wi-Fi stays up).")
 def cycle():
-    with modem_session() as c:
-        if not modem.cycle_data(c):
-            fail("Modem didn't accept the data switch.")
+    require_home()
+    modem.cycle_data(settings)
     console.print("[green]Data connection restarted.[/green]")
 
 

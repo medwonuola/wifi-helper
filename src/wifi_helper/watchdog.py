@@ -66,8 +66,7 @@ class Watchdog:
         try:
             match action:
                 case Action.CYCLE_DATA:
-                    with modem.session(self.settings) as c:
-                        ok = modem.cycle_data(c)
+                    ok = modem.cycle_data(self.settings)
                 case Action.REBOOT_MODEM:
                     with modem.session(self.settings) as c:
                         ok = modem.reboot(c)
